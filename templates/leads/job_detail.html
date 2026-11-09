@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block title %}نتایج جست‌وجو | سرنخ‌یاب{% endblock %}
+{% block content %}
+{% if job.status == 'queued' or job.status == 'running' %}<meta http-equiv="refresh" content="5">{% endif %}
+<a class="back-link" href="{% url 'search' %}">→ بازگشت به جست‌وجوها</a>
+<section class="job-header card"><div class="job-title"><div><p class="eyebrow">{{ job.get_geographic_scope_type_display }} · {{ job.geographic_scope_name }}</p><h1>{{ job.trade_name }}</h1><p class="muted">ثبت‌شده در {{ job.created_at|date:'Y/m/d H:i' }}</p></div><span class="status-pill large {{ job.status }}">{{ job.get_status_display }}</span></div>
+  {% if job.status == 'queued' or job.status == 'running' %}<div class="progress-track"><span></span></div><p class="muted">جست‌وجو در پس‌زمینه ادامه دارد؛ این صفحه هر ۵ ثانیه به‌روز می‌شود.</p>{% endif %}
+  <div class="stats"><div><strong>{{ job.total_unique_businesses }}</strong><span>کسب‌وکار یکتا</span></div><div><strong>{{ job.total_raw_results }}</strong><span>نتیجه از منابع</span></div><div><strong>{{ job.total_errors }}</strong><span>منبع ناموفق</span></div></div>
+  {% if job.error_summary %}<div class="notice warning">{{ job.error_summary|linebreaksbr }}</div>{% endif %}
+  <div class="source-statuses">{% for source in job.source_executions.all %}<div class="source-status"><span>{{ source.source_name|title }}</span><span class="status-pill {{ source.status }}">{{ source.get_status_display }}</span><small>{{ source.request_count }} درخواست · {{ source.result_count }} نتیجهٔ خام</small>{% if source.error_details %}<p class="error-text">{{ source.error_details }}</p>{% endif %}</div>{% endfor %}</div>
+  <div class="export-actions"><a class="button secondary" href="{% url 'export_excel' job.pk %}">دریافت Excel</a><a class="button secondary" href="{% url 'export_json' job.pk %}">دریافت JSON</a></div>
+</section>
+<section class="card results-card"><div class="section-heading"><div><p class="eyebrow">خروجی</p><h2>کسب‌وکارها</h2></div></div>
+  <form method="get" class="filters">
+    <label>منبع<select name="source"><option value="">همه</option>{% for source in job.selected_sources %}<option value="{{ source }}" {% if filters.source == source %}selected{% endif %}>{{ source|title }}</option>{% endfor %}</select></label>
+    <label>شهر<input type="text" name="city" value="{{ filters.city }}" maxlength="120" placeholder="نام شهر"></label>
+    <label>اعتبارسنجی<select name="verification"><option value="">همه</option>{% for value,label in verification_choices %}<option value="{{ value }}" {% if filters.verification == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label class="check-filter"><input type="checkbox" name="has_phone" value="1" {% if filters.has_phone %}checked{% endif %}> دارای تلفن</label><label class="check-filter"><input type="checkbox" name="has_website" value="1" {% if filters.has_website %}checked{% endif %}> دارای وب‌سایت</label><button class="button primary small" type="submit">اعمال فیلتر</button>
+  </form>
+  {% if page_obj.object_list %}<div class="table-wrap"><table><thead><tr><th>نام کسب‌وکار</th><th>تلفن</th><th>نشانی</th><th>شهر</th><th>وب‌سایت</th><th>منبع</th><th>وضعیت</th></tr></thead><tbody>
+  {% for lead in page_obj %}<tr><td><a class="lead-name" href="{% url 'lead_detail' job.pk lead.pk %}">{{ lead.original_name }}</a><small>{{ lead.business_category }}</small></td><td>{% for phone in lead.phone_numbers %}<span class="phone">{{ phone }}</span>{% empty %}<span class="muted">—</span>{% endfor %}</td><td>{{ lead.address|default:'—' }}</td><td>{{ lead.city|default:job.geographic_scope_name|default:'—' }}</td><td>{% if lead.website %}<a href="{{ lead.website }}" rel="nofollow noopener" target="_blank">مشاهده</a>{% else %}—{% endif %}</td><td>{% for source in lead.source_names %}<span class="source-tag">{{ source }}</span>{% endfor %}</td><td><span class="status-pill {{ lead.verification_status }}">{{ lead.get_verification_status_display }}</span></td></tr>{% endfor %}
+  </tbody></table></div><nav class="pagination" aria-label="صفحه‌بندی">{% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}&source={{ filters.source }}&city={{ filters.city|urlencode }}&verification={{ filters.verification }}{% if filters.has_phone %}&has_phone=1{% endif %}{% if filters.has_website %}&has_website=1{% endif %}">قبلی</a>{% endif %}<span>صفحهٔ {{ page_obj.number }} از {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}&source={{ filters.source }}&city={{ filters.city|urlencode }}&verification={{ filters.verification }}{% if filters.has_phone %}&has_phone=1{% endif %}{% if filters.has_website %}&has_website=1{% endif %}">بعدی</a>{% endif %}</nav>
+  {% else %}<div class="empty-state"><span>⌕</span><p>با این فیلتر نتیجه‌ای پیدا نشد.</p></div>{% endif %}
+</section>
+{% endblock %}

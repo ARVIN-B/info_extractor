@@ -1,0 +1,23 @@
+{% extends 'base.html' %}
+{% block title %}جست‌وجوی کسب‌وکار | سرنخ‌یاب{% endblock %}
+{% block content %}
+<section class="hero"><div><p class="eyebrow">کشف اطلاعات تماس عمومی</p><h1>کسب‌وکارهای موردنظرت را پیدا کن</h1><p class="muted">جست‌وجو در نقشه‌های نشان و بلد، همراه با منبع و شواهد هر اطلاعات.</p></div><div class="hero-icon" aria-hidden="true">⌕</div></section>
+<div class="layout">
+  <section class="card form-card"><div class="section-heading"><div><p class="eyebrow">جست‌وجوی تازه</p><h2>مشخصات جست‌وجو</h2></div></div>
+    <form method="post" class="stack">{% csrf_token %}{% for error in form.non_field_errors %}<div class="notice error">{{ error }}</div>{% endfor %}
+      <div class="field"><label for="{{ form.trade_name.id_for_label }}">{{ form.trade_name.label }}</label>{{ form.trade_name }}{{ form.trade_name.errors }}<small>مثلاً طلافروشی، رستوران یا کلینیک</small></div>
+      <div class="field"><label for="{{ form.geographic_scope_type.id_for_label }}">{{ form.geographic_scope_type.label }}</label>{{ form.geographic_scope_type }}{{ form.geographic_scope_type.errors }}</div>
+      <div class="field" id="scope-name-field"><label for="{{ form.geographic_scope_name.id_for_label }}">{{ form.geographic_scope_name.label }}</label>{{ form.geographic_scope_name }}{{ form.geographic_scope_name.errors }}<small>برای نمونه، تهران یا استان فارس</small></div>
+      <div class="field"><span class="field-label">{{ form.sources.label }}</span><div class="source-options">{{ form.sources }}</div>{{ form.sources.errors }}</div>
+      <div class="field"><label for="{{ form.max_results.id_for_label }}">{{ form.max_results.label }}</label>{{ form.max_results }}{{ form.max_results.errors }}<small>از ۱ تا ۵۰۰ سرنخ</small></div>
+      <button class="button primary" type="submit">شروع جست‌وجو <span>←</span></button>
+    </form>
+    <div class="privacy-note"><span>ⓘ</span><p>شمارهٔ تلفن فقط از نظر قالب بررسی می‌شود؛ این بررسی فعال‌بودن یا مالکیت شماره را ثابت نمی‌کند.</p></div>
+  </section>
+  <aside class="card recent-card"><div class="section-heading"><div><p class="eyebrow">تاریخچه</p><h2>جست‌وجوهای اخیر</h2></div></div>
+    {% if jobs %}<div class="job-list">{% for job in jobs %}<a class="job-row" href="{% url 'job_detail' job.pk %}"><div class="job-row-top"><strong>{{ job.trade_name }}</strong><span class="status-pill {{ job.status }}">{{ job.get_status_display }}</span></div><span class="muted">{{ job.geographic_scope_name }} · {{ job.created_at|date:'Y/m/d H:i' }}</span><span class="job-count">{{ job.total_unique_businesses }} نتیجه</span></a>{% endfor %}</div>
+    {% else %}<div class="empty-state"><span>⌕</span><p>هنوز جست‌وجویی ثبت نشده است.</p></div>{% endif %}
+  </aside>
+</div>
+<script>const scopeType=document.getElementById('id_geographic_scope_type');const scopeField=document.getElementById('scope-name-field');function syncScope(){scopeField.hidden=scopeType.value==='iran';}scopeType.addEventListener('change',syncScope);syncScope();</script>
+{% endblock %}

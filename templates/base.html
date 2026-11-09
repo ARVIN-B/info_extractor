@@ -1,0 +1,21 @@
+{% load static %}
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}سرنخ‌یاب{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'leads/app.css' %}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{% url 'search' %}"><span class="brand-mark">س</span> سرنخ‌یاب</a>
+    {% if user.is_authenticated %}<div class="top-actions"><span class="user-label">{{ user.get_username }}</span><form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="text-button" type="submit">خروج</button></form></div>{% endif %}
+  </header>
+  <main class="container">
+    {% if messages %}<div class="messages">{% for message in messages %}<div class="notice {{ message.tags }}">{{ message }}</div>{% endfor %}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">اطلاعات عمومی کسب‌وکارها · داده‌ها همراه با منبع ثبت می‌شوند</footer>
+</body>
+</html>
