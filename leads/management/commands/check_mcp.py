@@ -32,11 +32,11 @@ class Command(BaseCommand):
     async def _probe(self, source, query, city, point):
         config = SOURCE_REGISTRY[source]
         async with source_session(source) as client:
-            search_tool = config["tools"]["search"]
+            search_tool = config["tools"].get("nearby", config["tools"]["search"])
             if source == "neshan":
                 result = await client.call(search_tool, {"query": query, "near": city, "limit": 3})
             else:
-                result = await client.call(search_tool, {"query": f"{query} {city}", "lat": point[0], "lng": point[1], "limit": 3})
+                result = await client.call(search_tool, {"what": query, "lat": point[0], "lng": point[1], "radius_km": 20, "limit": 3})
             names = [tool for tool in client.tools if tool in config["tools"].values()]
             rows = _records(result.data)
             first = next((row for row in rows if row.get("id")), None)

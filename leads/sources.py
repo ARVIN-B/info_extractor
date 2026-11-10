@@ -1,4 +1,5 @@
 import asyncio
+from difflib import SequenceMatcher
 import json
 import logging
 import math
@@ -49,11 +50,50 @@ PROVINCE_CAPITALS = {
 def get_trade_variants(trade_name):
     path = Path(__file__).parent / "data" / "trade_synonyms.json"
     dictionary = json.loads(path.read_text(encoding="utf-8"))
-    normalized = normalize_text(trade_name)
+    base = " ".join(trade_name.replace("\u200c", " ").split())
+    base = re.sub(r"\s+(?:های|ها)$", "", base).strip()
+    normalized = normalize_text(base)
     for trade, variants in dictionary.items():
         if normalize_text(trade) == normalized:
             return list(dict.fromkeys(variants))[:3]
-    return [trade_name.strip()]
+    variants = [base]
+    if base.endswith(" فروشی"):
+        noun = base.removesuffix(" فروشی").strip()
+        if noun:
+            variants.append(f"فروشگاه {noun}")
+            variants.append(f"{noun} سرای")
+    elif base.startswith("فروشگاه "):
+        variants.append(base.removeprefix("فروشگاه ").strip())
+    return list(dict.fromkeys(variant for variant in variants if variant))[:3]
+
+
+def is_relevant_trade_record(trade_name, variants, record):
+    name = normalize_text(str(_first(record, "name", "title", "maintext")))
+    category = normalize_text(str(_first(record, "category", "business_category")))
+    if not name:
+        return False
+    for variant in variants:
+        phrase = normalize_text(variant)
+        if phrase and (phrase in name or phrase in category):
+            return True
+    trade_tokens = normalize_text(re.sub(r"\s+(?:های|ها)$", "", trade_name)).split()
+    return bool(trade_tokens) and all(token in name or token in category for token in trade_tokens)
+
+
+def canonical_scope_name(name, scope_type):
+    choices = CITY_CENTERS if scope_type == SearchJob.ScopeType.CITY else PROVINCE_CAPITALS
+    normalized = normalize_text(name)
+    for candidate in choices:
+        if normalize_text(candidate) == normalized:
+            return candidate
+    ranked = sorted(
+        ((SequenceMatcher(None, normalized, normalize_text(candidate)).ratio(), candidate) for candidate in choices),
+        reverse=True,
+    )
+    threshold = 0.86 if len(normalized) <= 5 else 0.80
+    if ranked and ranked[0][0] >= threshold:
+        return ranked[0][1]
+    return name.strip()
 
 
 def _known_center(city):
@@ -63,10 +103,12 @@ def _known_center(city):
 
 def get_scope_points(job):
     if job.geographic_scope_type == SearchJob.ScopeType.CITY:
-        point = _known_center(job.geographic_scope_name)
-        return [(job.geographic_scope_name, point)]
+        city = canonical_scope_name(job.geographic_scope_name, SearchJob.ScopeType.CITY)
+        point = _known_center(city)
+        return [(city, point)]
     if job.geographic_scope_type == SearchJob.ScopeType.PROVINCE:
-        capital = PROVINCE_CAPITALS.get(job.geographic_scope_name)
+        province = canonical_scope_name(job.geographic_scope_name, SearchJob.ScopeType.PROVINCE)
+        capital = PROVINCE_CAPITALS.get(province)
         return [(capital or job.geographic_scope_name, _known_center(capital or ""))]
     return list(CITY_CENTERS.items())
 
@@ -98,9 +140,9 @@ def _first(data, *keys):
 
 def _format_phone_values(value):
     if isinstance(value, str):
-        return [value]
+        return [value.strip()] if value.strip() else []
     if isinstance(value, list):
-        return [str(phone) for phone in value if isinstance(phone, (str, int))]
+        return [str(phone).strip() for phone in value if isinstance(phone, (str, int)) and str(phone).strip()]
     return []
 
 
@@ -169,7 +211,7 @@ def save_lead(job, source, search_record, detail):
         return None
     website, _ = normalize_website(fields["website"])
     valid_phones = [normalize_phone(phone) for phone in fields["phones"] if phone_is_valid(phone)]
-    invalid_phone_values = [str(phone) for phone in fields["phones"] if not phone_is_valid(phone)]
+    invalid_phone_values = [str(phone).strip() for phone in fields["phones"] if str(phone).strip() and not phone_is_valid(phone)]
     all_phone_values = list(dict.fromkeys(valid_phones + invalid_phone_values))
     lead = _find_match(job, source, record_id, fields)
     source_ids = dict(lead.source_record_ids) if lead else {}
@@ -246,7 +288,9 @@ def _float_or_none(value):
 
 async def _search_source(source, job, execution):
     config = SOURCE_REGISTRY[source]
-    search_tool, detail_tool = config["tools"]["search"], config["tools"]["detail"]
+    geocode_tool = config["tools"]["search"]
+    search_tool = config["tools"].get("nearby", geocode_tool)
+    detail_tool = config["tools"]["detail"]
     variants = get_trade_variants(job.trade_name)
     scope_points = get_scope_points(job)
     remaining = max(0, job.max_results - await sync_to_async(job.leads.count, thread_sensitive=True)())
@@ -264,6 +308,7 @@ async def _search_source(source, job, execution):
     processed_ids = set()
     saved = 0
     detail_errors = []
+    detail_rate_limited = False
 
     async def invoke(client, tool_name, arguments):
         try:
@@ -283,12 +328,12 @@ async def _search_source(source, job, execution):
         return result
 
     async with source_session(source, enforce_rate_limit=True) as client:
-        # Resolve a city/province location using Balad's documented geocoding search when no local center exists.
+        # Resolve a city/province location using the source's geocoding search when no local center exists.
         if source in {"balad", "neshan"} and scope_points and scope_points[0][1] is None:
             resolve_args = {"query": scope_points[0][0], "limit": 10}
             if source == "neshan":
                 resolve_args["near"] = "Tehran"
-            resolved = await invoke(client, search_tool, resolve_args)
+            resolved = await invoke(client, geocode_tool, resolve_args)
             execution.request_count = client.request_count
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
             wanted = normalize_text(scope_points[0][0])
@@ -303,14 +348,17 @@ async def _search_source(source, job, execution):
             for variant in variants:
                 if saved >= source_budget or location_saved >= per_location_budget:
                     break
-                query = variant if job.geographic_scope_type == SearchJob.ScopeType.IRAN else f"{variant} {place_name}"
                 if source == "neshan":
                     near = place_name if _known_center(place_name) and job.geographic_scope_type != SearchJob.ScopeType.IRAN else f"{point[0]},{point[1]}"
-                    args = {"query": query, "near": near, "limit": min(30, max(1, per_location_budget - location_saved))}
+                    args = {"query": variant, "near": near, "limit": min(30, max(1, per_location_budget - location_saved))}
                 else:
-                    args = {"query": query, "limit": min(20, max(1, per_location_budget - location_saved))}
-                    if point:
-                        args.update({"lat": point[0], "lng": point[1]})
+                    args = {
+                        "what": variant,
+                        "lat": point[0],
+                        "lng": point[1],
+                        "radius_km": 20,
+                        "limit": min(40, max(1, per_location_budget - location_saved)),
+                    }
                 result = await invoke(client, search_tool, args)
                 execution.request_count = client.request_count
                 execution.result_count += len(_records(result.data))
@@ -320,18 +368,25 @@ async def _search_source(source, job, execution):
                     if not identifier or str(identifier) in processed_ids:
                         continue
                     processed_ids.add(str(identifier))
+                    if not is_relevant_trade_record(job.trade_name, variants, record):
+                        continue
                     detail_arg = "place_id" if source == "neshan" else "id"
-                    try:
-                        detail = await invoke(client, detail_tool, {detail_arg: str(identifier)})
-                        detail_data = detail.data
-                    except MCPSourceError as exc:
+                    if detail_rate_limited:
                         detail_data = {}
-                        detail_errors.append(f"{identifier}: {exc}")
-                        execution.error_count += 1
-                        execution.error_details = "\n".join(detail_errors)[-2000:]
-                        await sync_to_async(execution.save, thread_sensitive=True)(
-                            update_fields=["request_count", "error_count", "error_details"]
-                        )
+                    else:
+                        try:
+                            detail = await invoke(client, detail_tool, {detail_arg: str(identifier)})
+                            detail_data = detail.data
+                        except MCPSourceError as exc:
+                            detail_data = {}
+                            detail_errors.append(f"{identifier}: {exc}")
+                            if "429" in str(exc) or "rate limit" in str(exc).lower():
+                                detail_rate_limited = True
+                            execution.error_count += 1
+                            execution.error_details = "\n".join(detail_errors)[-2000:]
+                            await sync_to_async(execution.save, thread_sensitive=True)(
+                                update_fields=["request_count", "error_count", "error_details"]
+                            )
                     execution.request_count = client.request_count
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
                     record["_searched_city"] = place_name

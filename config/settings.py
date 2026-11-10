@@ -100,7 +100,18 @@ SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", not DEBUG)
 CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", not DEBUG)
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-CELERY_BROKER_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL") or os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+if CELERY_BROKER_URL.startswith("filesystem://"):
+    # Local single-machine queue for development when Redis is not installed.
+    CELERY_QUEUE_DIR = BASE_DIR / "var" / "celery-broker"
+    CELERY_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    CELERY_CONTROL_DIR = CELERY_QUEUE_DIR / "control"
+    CELERY_CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+    CELERY_BROKER_TRANSPORT_OPTIONS = {
+        "data_folder_in": str(CELERY_QUEUE_DIR),
+        "data_folder_out": str(CELERY_QUEUE_DIR),
+        "control_folder": str(CELERY_CONTROL_DIR),
+    }
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 900
 CELERY_TASK_SOFT_TIME_LIMIT = 840

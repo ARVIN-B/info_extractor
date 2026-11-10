@@ -4,6 +4,7 @@ from django.conf import settings
 from .models import SearchJob
 from .normalization import normalize_text
 from .mcp_client import SOURCE_REGISTRY
+from .sources import canonical_scope_name
 
 
 class SearchJobForm(forms.Form):
@@ -27,4 +28,6 @@ class SearchJobForm(forms.Form):
             self.add_error("geographic_scope_name", "برای جست‌وجوی شهر یا استان نام محدوده را وارد کنید.")
         if scope_type == SearchJob.ScopeType.IRAN:
             cleaned["geographic_scope_name"] = "ایران"
+        elif scope_name:
+            cleaned["geographic_scope_name"] = canonical_scope_name(scope_name, scope_type)
         return cleaned

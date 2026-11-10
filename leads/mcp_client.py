@@ -21,7 +21,7 @@ SOURCE_REGISTRY = {
     },
     "balad": {
         "package": "balad-mcp==0.2.0",
-        "tools": {"search": "bl_search", "detail": "bl_place"},
+        "tools": {"search": "bl_search", "nearby": "bl_nearby", "detail": "bl_place"},
         "proxy_env": "BALAD_MCP_PROXY",
     },
 }
@@ -43,10 +43,15 @@ class MCPCallResult:
 
 
 def decode_result(result):
-    if getattr(result, "isError", False):
+    is_error = getattr(result, "isError", None)
+    if is_error is None:
+        is_error = getattr(result, "is_error", False)
+    if is_error:
         details = "; ".join(getattr(item, "text", "") for item in result.content if getattr(item, "text", ""))
         raise MCPSourceError(details[:1000] or "MCP tool returned an error")
     structured = getattr(result, "structuredContent", None)
+    if structured is None:
+        structured = getattr(result, "structured_content", None)
     if structured is not None:
         return structured
     values = []

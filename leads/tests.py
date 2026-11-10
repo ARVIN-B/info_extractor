@@ -3,6 +3,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from django.contrib.auth import get_user_model
@@ -13,9 +14,10 @@ from mcp.types import TextContent
 from openpyxl import load_workbook
 
 from .mcp_client import MCPCallResult, MCPSourceError, MCPToolClient, decode_result
+from .forms import SearchJobForm
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
-from .sources import calculate_source_budget, execute_source, save_lead
+from .sources import calculate_source_budget, execute_source, get_scope_points, get_trade_variants, is_relevant_trade_record, save_lead
 from .tasks import recover_stale_search_jobs, run_search_job
 
 
@@ -37,6 +39,32 @@ class NormalizationTests(TestCase):
         self.assertEqual(calculate_source_budget(100, 2, 100, 0), 50)
         self.assertEqual(calculate_source_budget(100, 2, 50, 1), 50)
         self.assertEqual(calculate_source_budget(1, 2, 1, 0), 1)
+
+    def test_generic_trade_variants_normalize_persian_plural_and_shop_wording(self):
+        self.assertEqual(get_trade_variants("شیشه فروشی های"), ["شیشه فروشی", "فروشگاه شیشه", "شیشه سرای"])
+        self.assertEqual(get_trade_variants("رستوران ها"), ["رستوران", "غذاخوری"])
+        self.assertEqual(get_trade_variants("آتلیه های"), ["آتلیه"])
+        self.assertEqual(get_trade_variants("کافه"), ["کافه"])
+
+    def test_trade_relevance_keeps_matching_shop_categories_and_drops_unrelated_names(self):
+        variants = get_trade_variants("شیشه فروشی های")
+        self.assertTrue(is_relevant_trade_record("شیشه فروشی های", variants, {"name": "آینه فروشی", "category": "فروشگاه شیشه و آینه"}))
+        self.assertTrue(is_relevant_trade_record("شیشه فروشی های", variants, {"name": "شیشه سرای فدک", "category": "فروشگاه"}))
+        self.assertFalse(is_relevant_trade_record("شیشه فروشی های", variants, {"name": "ترمیم ترک شیشه خودرو", "category": "تعمیرات خودرو"}))
+
+    def test_city_scope_accepts_a_small_typo_and_uses_the_canonical_center(self):
+        job = SimpleNamespace(geographic_scope_type=SearchJob.ScopeType.CITY, geographic_scope_name="اصفها")
+        points = get_scope_points(job)
+        self.assertEqual(points[0][0], "اصفهان")
+        self.assertIsNotNone(points[0][1])
+
+    def test_search_form_canonicalizes_a_small_city_typo(self):
+        form = SearchJobForm(data={
+            "trade_name": "شیشه فروشی های", "geographic_scope_type": "city", "geographic_scope_name": "اصفها",
+            "sources": ["neshan", "balad"], "max_results": 100,
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.cleaned_data["geographic_scope_name"], "اصفهان")
 
 
 class LeadPersistenceTests(TransactionTestCase):
@@ -65,9 +93,10 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(self.job.leads.count(), 2)
 
     def test_failed_place_detail_keeps_search_record_and_continues_source(self):
+        self.job.trade_name = "کافه"
         self.job.selected_sources = ["neshan"]
         self.job.max_results = 2
-        self.job.save(update_fields=["selected_sources", "max_results"])
+        self.job.save(update_fields=["trade_name", "selected_sources", "max_results"])
         execution = SourceExecution.objects.create(search_job=self.job, source_name="neshan")
 
         class FakeClient:
@@ -99,6 +128,79 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertIn("detail endpoint unavailable", execution.error_details)
         self.assertEqual(SourceToolCall.objects.filter(source_execution=execution, error_summary__gt="").count(), 1)
 
+    def test_detail_rate_limit_is_reported_and_further_detail_calls_stop(self):
+        self.job.trade_name = "کافه"
+        self.job.selected_sources = ["neshan"]
+        self.job.max_results = 2
+        self.job.save(update_fields=["trade_name", "selected_sources", "max_results"])
+        execution = SourceExecution.objects.create(search_job=self.job, source_name="neshan")
+
+        class FakeClient:
+            request_count = 0
+            calls = []
+
+            async def call(self, tool_name, arguments):
+                self.request_count += 1
+                self.calls.append(tool_name)
+                if tool_name == "ns_search":
+                    return MCPCallResult({"results": [
+                        {"id": "a" * 32, "name": "کافه اول", "phone": "02112345678", "address": "تهران ۱"},
+                        {"id": "b" * 32, "name": "کافه دوم", "phone": "02112345679", "address": "تهران ۲"},
+                    ]}, 1)
+                raise MCPSourceError("neshan rate limiting requests (HTTP 429)")
+
+        client = FakeClient()
+
+        @asynccontextmanager
+        async def fake_session(source, **kwargs):
+            yield client
+
+        with patch("leads.sources.source_session", fake_session):
+            count = execute_source("neshan", self.job, execution)
+        execution.refresh_from_db()
+        self.assertEqual(count, 2)
+        self.assertEqual(client.calls, ["ns_search", "ns_place"])
+        self.assertEqual(execution.status, SourceExecution.Status.FAILED)
+        self.assertEqual(execution.error_count, 1)
+        self.assertIn("429", execution.error_details)
+        self.assertEqual(self.job.leads.count(), 2)
+
+    def test_balad_category_search_uses_nearby_and_saves_place_details(self):
+        self.job.trade_name = "شیشه فروشی های"
+        self.job.selected_sources = ["balad"]
+        self.job.max_results = 2
+        self.job.save(update_fields=["trade_name", "selected_sources", "max_results"])
+        execution = SourceExecution.objects.create(search_job=self.job, source_name="balad")
+        record = {"id": "AbCdEf123456", "name": "شیشه فروشی نمونه", "phone": "03112345678", "address": "اصفهان، خیابان نمونه"}
+
+        class FakeClient:
+            request_count = 0
+            calls = []
+
+            async def call(self, tool_name, arguments):
+                self.request_count += 1
+                self.calls.append((tool_name, arguments))
+                if tool_name == "bl_nearby":
+                    return MCPCallResult({"places": [record]}, 1)
+                return MCPCallResult({**record, "phones": [record["phone"]]}, 1)
+
+        client = FakeClient()
+
+        @asynccontextmanager
+        async def fake_session(source, **kwargs):
+            yield client
+
+        with patch("leads.sources.source_session", fake_session):
+            count = execute_source("balad", self.job, execution)
+        execution.refresh_from_db()
+        self.assertEqual(count, 1)
+        self.assertEqual(execution.status, SourceExecution.Status.COMPLETED)
+        self.assertEqual([call[0] for call in client.calls], ["bl_nearby", "bl_place", "bl_nearby", "bl_nearby"])
+        self.assertEqual(client.calls[0][1]["what"], "شیشه فروشی")
+        self.assertEqual(client.calls[0][1]["radius_km"], 20)
+        self.assertEqual(client.calls[2][1]["what"], "فروشگاه شیشه")
+        self.assertEqual(self.job.leads.get().source_record_ids["balad"], record["id"])
+
     def test_conflicting_source_values_are_preserved_as_evidence(self):
         search = {"id": "a" * 32, "name": "کافه آفتاب", "phone": "09123456789", "address": "خیابان ولیعصر، پلاک ۱"}
         lead = save_lead(self.job, "neshan", search, {"name": search["name"], "phones": [search["phone"]], "address": search["address"], "website": "https://first.example"})
@@ -107,6 +209,11 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(lead.website, "https://first.example")
         self.assertEqual(lead.verification_status, BusinessLead.Verification.CONFLICTING)
         self.assertGreaterEqual(lead.evidence.filter(field_name="website").count(), 2)
+
+    def test_blank_phone_values_are_not_saved_as_contact_numbers(self):
+        record = {"id": "a" * 32, "name": "کافه نمونه", "phone": "", "address": "تهران"}
+        lead = save_lead(self.job, "neshan", record, {"phones": ["", "  ", "02112345678"]})
+        self.assertEqual(lead.phone_numbers, ["02112345678"])
 
 
 class MCPClientTests(TestCase):
@@ -146,6 +253,9 @@ class MCPClientTests(TestCase):
         response = type("Response", (), {"isError": True, "structuredContent": None, "content": [TextContent(type="text", text="unavailable")]})()
         with self.assertRaises(MCPSourceError):
             decode_result(response)
+        snake_case_response = type("Response", (), {"is_error": True, "structured_content": None, "content": [TextContent(type="text", text="rate limited")]})()
+        with self.assertRaisesRegex(MCPSourceError, "rate limited"):
+            decode_result(snake_case_response)
 
     def test_transient_connection_error_retries_once(self):
         response = type("Response", (), {"isError": False, "structuredContent": {"results": []}, "content": []})()
