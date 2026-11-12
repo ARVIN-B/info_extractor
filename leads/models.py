@@ -42,6 +42,8 @@ class SourceExecution(models.Model):
     class Status(models.TextChoices):
         QUEUED = "queued", "در صف"
         RUNNING = "running", "در حال اجرا"
+        PARTIAL = "partial", "نیمه‌کامل"
+        SKIPPED = "skipped", "موقتاً متوقف"
         COMPLETED = "completed", "تکمیل‌شده"
         FAILED = "failed", "ناموفق"
 
@@ -53,6 +55,9 @@ class SourceExecution(models.Model):
     request_count = models.PositiveSmallIntegerField(default=0)
     result_count = models.PositiveIntegerField(default=0)
     error_count = models.PositiveSmallIntegerField(default=0)
+    query_variants = models.JSONField(default=list, blank=True)
+    areas_checked = models.JSONField(default=list, blank=True)
+    truncated = models.BooleanField(default=False)
     error_details = models.TextField(blank=True)
 
     class Meta:
@@ -72,6 +77,32 @@ class SourceToolCall(models.Model):
         ordering = ["called_at", "id"]
 
 
+class SourceRateLimit(models.Model):
+    """Persistent per-source cooldown so later jobs respect upstream rate limits too."""
+
+    source_name = models.CharField(max_length=40, unique=True)
+    cooldown_until = models.DateTimeField(db_index=True)
+    reason = models.CharField(max_length=160, blank=True)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["source_name"]
+
+
+class SourcePlaceDetailCache(models.Model):
+    """Short-lived, sanitized detail responses to avoid repeating provider calls."""
+
+    source_name = models.CharField(max_length=40)
+    source_record_id = models.CharField(max_length=255)
+    detail_data = models.JSONField(default=dict)
+    expires_at = models.DateTimeField(db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["source_name", "source_record_id"], name="uniq_source_place_detail_cache")]
+        indexes = [models.Index(fields=["source_name", "expires_at"])]
+
+
 class BusinessLead(models.Model):
     class Verification(models.TextChoices):
         DISCOVERED = "discovered", "کشف‌شده"
@@ -81,14 +112,28 @@ class BusinessLead(models.Model):
         CONFLICTING = "conflicting", "اطلاعات متعارض"
         UNVERIFIED = "unverified", "تأییدنشده"
 
+    class PhoneStatus(models.TextChoices):
+        FOUND_PUBLIC = "found_public", "تلفن عمومی پیدا شد؛ فعال بودن تأیید نشده"
+        NOT_PROVIDED = "not_provided_by_source", "منبع تلفن ارائه نمی‌کند"
+        NOT_FOUND = "not_found", "تلفن عمومی پیدا نشد"
+        CONFLICTING = "conflicting", "تلفن‌ها متعارض‌اند"
+        INVALID = "invalid", "قالب تلفن نامعتبر"
+        NOT_CHECKED = "not_checked", "بررسی نشده"
+
     search_job = models.ForeignKey(SearchJob, on_delete=models.CASCADE, related_name="leads")
     normalized_name = models.CharField(max_length=255, db_index=True)
     original_name = models.CharField(max_length=255)
     phone_numbers = models.JSONField(default=list, blank=True)
+    emails = models.JSONField(default=list, blank=True)
+    social_urls = models.JSONField(default=list, blank=True)
     address = models.TextField(blank=True)
     city = models.CharField(max_length=120, blank=True, db_index=True)
     province = models.CharField(max_length=120, blank=True)
     website = models.URLField(max_length=500, blank=True)
+    national_id = models.CharField(max_length=32, blank=True)
+    business_type = models.CharField(max_length=40, blank=True)
+    phone_status = models.CharField(max_length=32, choices=PhoneStatus.choices, default=PhoneStatus.NOT_CHECKED)
+    confidence_score = models.FloatField(default=0.0)
     business_category = models.CharField(max_length=160, blank=True)
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
@@ -113,6 +158,10 @@ class LeadEvidence(models.Model):
     source_url = models.URLField(max_length=1000, blank=True)
     field_name = models.CharField(max_length=80)
     field_value = models.TextField(blank=True)
+    normalized_value = models.TextField(blank=True)
+    confidence_score = models.FloatField(default=0.0)
+    validation_status = models.CharField(max_length=40, blank=True)
+    data_type = models.CharField(max_length=40, default="public_business_data")
     extraction_method = models.CharField(max_length=40, default="mcp_tool_response")
     collected_at = models.DateTimeField(default=timezone.now)
     raw_response = models.JSONField(default=dict, blank=True)

@@ -24,7 +24,15 @@ def run_search_job(self, job_id):
 
     success_count = job.source_executions.filter(status=SourceExecution.Status.COMPLETED).count()
     try:
-        for execution in job.source_executions.all():
+        executions = {item.source_name: item for item in job.source_executions.all()}
+        # Preserve the user's selected source order so early sources cannot consume
+        # the whole result budget before later, higher-value sources run.
+        ordered_sources = list(dict.fromkeys(job.selected_sources))
+        ordered_sources.extend(name for name in executions if name not in ordered_sources)
+        for source_name in ordered_sources:
+            execution = executions.get(source_name)
+            if execution is None:
+                continue
             if execution.status == SourceExecution.Status.COMPLETED:
                 continue
             execute_source(execution.source_name, job, execution)
@@ -33,15 +41,16 @@ def run_search_job(self, job_id):
                 success_count += 1
             job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
             job.total_unique_businesses = job.leads.count()
-            job.total_errors = job.source_executions.filter(status=SourceExecution.Status.FAILED).count()
+            job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
             job.save(update_fields=["total_raw_results", "total_unique_businesses", "total_errors"])
-        errors = list(job.source_executions.filter(status=SourceExecution.Status.FAILED).values_list("source_name", "error_details"))
+        incomplete_sources = job.source_executions.exclude(status=SourceExecution.Status.COMPLETED)
+        errors = list(incomplete_sources.values_list("source_name", "error_details"))
         job.error_summary = "\n".join(f"{source}: {message}" for source, message in errors)
         has_results = job.leads.exists()
         job.status = SearchJob.Status.FAILED if not success_count and not has_results else (SearchJob.Status.PARTIAL if errors else SearchJob.Status.COMPLETED)
         job.total_unique_businesses = job.leads.count()
         job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
-        job.total_errors = len(errors)
+        job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
         job.completed_at = timezone.now()
         job.save(update_fields=["status", "completed_at", "error_summary", "total_raw_results", "total_unique_businesses", "total_errors"])
         return {"status": job.status, "leads": job.total_unique_businesses, "errors": job.total_errors}

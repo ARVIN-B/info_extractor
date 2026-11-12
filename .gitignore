@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 db.sqlite3
 var/celery-broker/
+var/*.log
 logs/
 staticfiles/
 .pytest_cache/

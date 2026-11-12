@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourceToolCall
+from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourceRateLimit, SourceToolCall
 
 
 class SourceExecutionInline(admin.TabularInline):
@@ -27,3 +27,9 @@ class BusinessLeadAdmin(admin.ModelAdmin):
 
 admin.site.register(LeadEvidence)
 admin.site.register(SourceToolCall)
+
+
+@admin.register(SourceRateLimit)
+class SourceRateLimitAdmin(admin.ModelAdmin):
+    list_display = ("source_name", "cooldown_until", "updated_at", "reason")
+    readonly_fields = ("source_name", "cooldown_until", "updated_at", "reason")

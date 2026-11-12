@@ -12,6 +12,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from .forms import SearchJobForm
+from .mcp_client import SOURCE_REGISTRY
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution
 from .tasks import run_search_job
 
@@ -66,6 +67,7 @@ def search(request):
 @login_required
 def job_detail(request, job_id):
     job = owned_job(request.user, job_id)
+    queue_wait_seconds = max(0, int((timezone.now() - job.created_at).total_seconds())) if job.status == SearchJob.Status.QUEUED else 0
     leads = job.leads.all()
     source = request.GET.get("source", "")
     city = request.GET.get("city", "").strip()[:120]
@@ -85,8 +87,18 @@ def job_detail(request, job_id):
     page = Paginator(leads.prefetch_related("evidence"), 25).get_page(request.GET.get("page"))
     return render(request, "leads/job_detail.html", {
         "job": job,
+        "queue_wait_seconds": queue_wait_seconds,
         "page_obj": page,
         "verification_choices": BusinessLead.Verification.choices,
+        "phone_status_choices": BusinessLead.PhoneStatus.choices,
+        "source_catalog": SOURCE_REGISTRY,
+        "summary": {
+            "with_phone": job.leads.exclude(phone_numbers=[]).count(),
+            "without_phone": job.leads.filter(phone_numbers=[]).count(),
+            "with_email": job.leads.exclude(emails=[]).count(),
+            "with_website": job.leads.exclude(website="").count(),
+            "partial_sources": job.source_executions.filter(status__in=[SourceExecution.Status.PARTIAL, SourceExecution.Status.SKIPPED]).count(),
+        },
         "filters": {"source": source, "city": city, "verification": verification, "has_phone": has_phone, "has_website": has_website},
     })
 
@@ -111,13 +123,21 @@ def export_json(request, job_id):
                 "scope_name": job.geographic_scope_name, "status": job.status},
         "results": [{
             "name": lead.original_name, "phones": lead.phone_numbers, "address": lead.address, "city": lead.city,
-            "province": lead.province, "website": lead.website, "category": lead.business_category,
+            "province": lead.province, "website": lead.website, "emails": lead.emails, "social_urls": lead.social_urls,
+            "national_id": lead.national_id, "business_type": lead.business_type, "phone_status": lead.phone_status,
+            "confidence_score": lead.confidence_score, "category": lead.business_category,
             "latitude": lead.latitude, "longitude": lead.longitude, "sources": lead.source_names,
             "verification_status": lead.verification_status,
             "evidence": [{"source": item.source_name, "record_id": item.source_record_id, "url": item.source_url,
                           "field": item.field_name, "value": item.field_value, "collected_at": item.collected_at.isoformat()}
                          for item in lead.evidence.all()],
         } for lead in leads],
+        "sources": [{
+            "source": execution.source_name, "status": execution.status, "requests": execution.request_count,
+            "raw_results": execution.result_count, "errors": execution.error_count,
+            "message": execution.error_details, "queries": execution.query_variants,
+            "areas_checked": execution.areas_checked, "truncated": execution.truncated,
+        } for execution in job.source_executions.all()],
     }
     response = HttpResponse(json.dumps(payload, ensure_ascii=False, indent=2), content_type="application/json; charset=utf-8")
     response["Content-Disposition"] = f'attachment; filename="leads-job-{job.pk}.json"'
@@ -135,12 +155,14 @@ def export_excel(request, job_id):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "سرنخ‌ها"
-    headers = ["نام کسب‌وکار", "شماره تلفن", "نشانی", "شهر", "استان", "وب‌سایت", "دسته‌بندی", "منبع", "وضعیت اعتبارسنجی"]
+    headers = ["نام کسب‌وکار", "صنف/دسته", "شهر", "استان", "نشانی", "تلفن عمومی", "ایمیل عمومی", "وب‌سایت", "شبکهٔ اجتماعی", "شناسهٔ ملی", "نوع کسب‌وکار", "منبع", "امتیاز کیفیت", "وضعیت تلفن", "وضعیت بررسی"]
     sheet.append(headers)
     for lead in job.leads.all():
         sheet.append([_excel_safe(value) for value in [
-            lead.original_name, "، ".join(lead.phone_numbers), lead.address, lead.city, lead.province, lead.website,
-            lead.business_category, "، ".join(lead.source_names), lead.get_verification_status_display(),
+            lead.original_name, lead.business_category, lead.city, lead.province, lead.address,
+            "، ".join(lead.phone_numbers), "، ".join(lead.emails), lead.website,
+            "، ".join(lead.social_urls), lead.national_id, lead.business_type,
+            "، ".join(lead.source_names), lead.confidence_score, lead.get_phone_status_display(), lead.get_verification_status_display(),
         ]])
     evidence = workbook.create_sheet("شواهد")
     evidence.append(["نام کسب‌وکار", "منبع", "شناسهٔ منبع", "پیوند", "فیلد", "مقدار", "زمان گردآوری"])

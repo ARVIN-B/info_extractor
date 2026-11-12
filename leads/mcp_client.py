@@ -1,7 +1,11 @@
 import asyncio
+from datetime import datetime, timezone as datetime_timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import os
+import random
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -18,11 +22,57 @@ SOURCE_REGISTRY = {
         "package": "neshan-mcp==0.2.0",
         "tools": {"search": "ns_search", "detail": "ns_place"},
         "proxy_env": "NESHAN_MCP_PROXY",
+        "display_name": "نشان",
+        "kind": "local_business",
+        "categories": ["local", "all"],
+        "fields": ["name", "category", "address", "phone", "website", "location"],
+        "coverage": "شهرهای پشتیبانی‌شده در ابزار نشان؛ نتایج محدود به سقف ابزار",
+        "access": "unofficial public read-only MCP",
+        "detail_min_interval_seconds": 6.0,
     },
     "balad": {
         "package": "balad-mcp==0.2.0",
         "tools": {"search": "bl_search", "nearby": "bl_nearby", "detail": "bl_place"},
         "proxy_env": "BALAD_MCP_PROXY",
+        "display_name": "بلد",
+        "kind": "local_business",
+        "categories": ["local", "all"],
+        "fields": ["name", "category", "address", "phone", "website", "location"],
+        "coverage": "شهرهای تحت پوشش ابزار بلد",
+        "access": "unofficial public read-only MCP",
+    },
+    "emalls": {
+        "package": "emalls-ir-mcp==0.2.0",
+        "tools": {"search": "em_search", "offers": "em_offers", "shops": "em_shops", "detail": "em_shop"},
+        "proxy_env": "EMALLS_MCP_PROXY",
+        "display_name": "ایمالز",
+        "kind": "online_shop",
+        "categories": ["online_shop", "retail", "all"],
+        "fields": ["name", "website", "address", "phone", "public shop profile"],
+        "coverage": "فروشگاه‌های فهرست‌شده در ایمالز؛ جست‌وجو با نام فروشگاه",
+        "access": "unofficial public read-only MCP",
+    },
+    "basalam": {
+        "package": "basalam-mcp==0.2.0",
+        "tools": {"search": "bs_search", "detail": "bs_vendor"},
+        "proxy_env": "BASALAM_MCP_PROXY",
+        "display_name": "باسلام",
+        "kind": "marketplace_seller",
+        "categories": ["online_shop", "retail", "home_business", "all"],
+        "fields": ["name", "public vendor profile", "listing lead"],
+        "coverage": "غرفه‌ها و فروشندگان حاضر در بازارگاه؛ تماس مستقل تضمین نمی‌شود",
+        "access": "unofficial public read-only MCP",
+    },
+    "rasmio": {
+        "package": "rasmio-mcp==0.2.0",
+        "tools": {"search": "rs_search_companies", "detail": "rs_company"},
+        "proxy_env": "RASMIO_MCP_PROXY",
+        "display_name": "رسمیو",
+        "kind": "registered_company",
+        "categories": ["company", "technology", "industry", "all"],
+        "fields": ["name", "national_id", "registration_id", "activity", "address"],
+        "coverage": "شرکت‌های ثبت‌شده؛ جست‌وجو عمومی، بازکردن پروندهٔ مهمان بسیار محدود",
+        "access": "unofficial public registry MCP; guest detail quota",
     },
 }
 
@@ -30,10 +80,44 @@ SOURCE_REGISTRY = {
 class MCPSourceError(Exception):
     """Safe, source-specific MCP error suitable for the job log."""
 
-    def __init__(self, message, duration_ms=0, retryable=False):
-        super().__init__(message)
+    def __init__(self, message, duration_ms=0, retryable=False, rate_limited=False, retry_after_seconds=None):
+        safe_message = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", str(message))
+        safe_message = re.sub(r"(?i)(api[_-]?key|token|authorization)(\s*[:=]\s*)[^\s,;]+", r"\1\2[redacted]", safe_message)
+        super().__init__(safe_message)
         self.duration_ms = duration_ms
         self.retryable = retryable
+        detected, detected_after = _rate_limit_details(safe_message)
+        self.rate_limited = rate_limited or detected
+        self.retry_after_seconds = retry_after_seconds or detected_after
+
+
+def _rate_limit_details(message):
+    text = str(message)
+    limited = bool(re.search(r"\b429\b|rate[ -]?limit|too many requests", text, re.IGNORECASE))
+    if not limited:
+        return False, None
+    retry_after = re.search(r"retry[- ]after\s*[:=]?\s*([^\s,;]+)", text, re.IGNORECASE)
+    if retry_after:
+        raw = retry_after.group(1)
+        if raw.isdigit():
+            return True, max(1, min(3600, int(raw)))
+        try:
+            parsed = parsedate_to_datetime(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime_timezone.utc)
+            seconds = int((parsed - datetime.now(datetime_timezone.utc)).total_seconds())
+            return True, max(1, min(3600, seconds))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    wait = re.search(r"wait\s+(\d+)\s*(seconds?|minutes?|hours?)", text, re.IGNORECASE)
+    if wait:
+        amount = int(wait.group(1))
+        unit = wait.group(2).lower()
+        seconds = amount * (3600 if unit.startswith("hour") else 60 if unit.startswith("minute") else 1)
+        return True, max(1, min(3600, seconds))
+    if re.search(r"wait\s+a\s+minute", text, re.IGNORECASE):
+        return True, 60
+    return True, 60
 
 
 @dataclass
@@ -48,7 +132,9 @@ def decode_result(result):
         is_error = getattr(result, "is_error", False)
     if is_error:
         details = "; ".join(getattr(item, "text", "") for item in result.content if getattr(item, "text", ""))
-        raise MCPSourceError(details[:1000] or "MCP tool returned an error")
+        details = details[:1000] or "MCP tool returned an error"
+        rate_limited, retry_after = _rate_limit_details(details)
+        raise MCPSourceError(details, rate_limited=rate_limited, retry_after_seconds=retry_after)
     structured = getattr(result, "structuredContent", None)
     if structured is None:
         structured = getattr(result, "structured_content", None)
@@ -69,7 +155,9 @@ async def source_session(source_name, enforce_rate_limit=False):
     config = SOURCE_REGISTRY.get(source_name)
     if not config:
         raise MCPSourceError(f"Source is not configured: {source_name}")
-    command = settings.MCP_SERVER_PATHS[source_name]
+    command = settings.MCP_SERVER_PATHS.get(source_name)
+    if not command:
+        raise MCPSourceError(f"{source_name} MCP executable is not configured in the project .venv")
     child_env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "TEMP", "TMP") if key in os.environ}
     if proxy := os.environ.get(config["proxy_env"]):
         child_env[config["proxy_env"]] = proxy
@@ -124,8 +212,14 @@ class MCPToolClient:
         self.distributed_limit = distributed_limit
 
     async def _call_with_source_limit(self, tool_name, arguments):
+        config = SOURCE_REGISTRY[self.source_name]
+        is_detail = tool_name == config["tools"].get("detail")
+        detail_interval = float(config.get("detail_min_interval_seconds", 0)) if is_detail else 0
         if not self.distributed_limit:
-            return await self.session.call_tool(tool_name, arguments)
+            response = await self.session.call_tool(tool_name, arguments)
+            if detail_interval:
+                await asyncio.sleep(detail_interval)
+            return response
         redis_client = Redis.from_url(settings.CELERY_BROKER_URL, socket_connect_timeout=5, socket_timeout=5)
         lock = redis_client.lock(
             f"info-extractor:mcp-source:{self.source_name}",
@@ -138,7 +232,11 @@ class MCPToolClient:
             acquired = await asyncio.to_thread(lock.acquire, blocking=True)
             if not acquired:
                 raise MCPSourceError(f"Timed out waiting for the {self.source_name} source concurrency slot")
-            return await self.session.call_tool(tool_name, arguments)
+            response = await self.session.call_tool(tool_name, arguments)
+            if detail_interval:
+                # Keep the cross-worker source lock during the spacing interval.
+                await asyncio.sleep(detail_interval)
+            return response
         except MCPSourceError:
             raise
         except Exception as exc:
@@ -190,7 +288,7 @@ class MCPToolClient:
                     duration = round((loop.time() - started) * 1000)
                     retryable = isinstance(exc, (ConnectionError, OSError))
                     raise MCPSourceError(f"{tool_name} failed: {type(exc).__name__}", duration, retryable=retryable) from exc
-            await asyncio.sleep(0.25 * (attempt + 1))
+            await asyncio.sleep(min(5.0, (0.5 * (2 ** attempt)) + random.uniform(0.05, 0.35)))
         raise MCPSourceError(f"{tool_name} failed after {attempts} attempts")
 
 

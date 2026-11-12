@@ -127,14 +127,21 @@ CELERY_BEAT_SCHEDULE = {
 
 SOURCE_TIMEOUT_SECONDS = int(os.environ.get("SOURCE_TIMEOUT_SECONDS", "45"))
 SOURCE_LOCK_WAIT_SECONDS = int(os.environ.get("SOURCE_LOCK_WAIT_SECONDS", "60"))
+SOURCE_MAX_CALLS_PER_JOB = int(os.environ.get("SOURCE_MAX_CALLS_PER_JOB", "40"))
+MAX_MCP_CALLS_PER_JOB = int(os.environ.get("MAX_MCP_CALLS_PER_JOB", "100"))
+SOURCE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
+SOURCE_DETAIL_CACHE_TTL_SECONDS = int(os.environ.get("SOURCE_DETAIL_CACHE_TTL_SECONDS", "86400"))
 MCP_DISTRIBUTED_SOURCE_LIMITS = env_bool("MCP_DISTRIBUTED_SOURCE_LIMITS", not DEBUG)
 ENABLED_MCP_SOURCES = [
     name.strip().lower()
     for name in os.environ.get("ENABLED_MCP_SOURCES", "neshan,balad").split(",")
-    if name.strip().lower() in {"neshan", "balad"}
+    if name.strip().lower() in {"neshan", "balad", "emalls", "basalam", "rasmio"}
 ]
 MCP_BIN_DIR = BASE_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin")
 MCP_SERVER_PATHS = {
-    "neshan": str(MCP_BIN_DIR / ("neshan-mcp.exe" if os.name == "nt" else "neshan-mcp")),
-    "balad": str(MCP_BIN_DIR / ("balad-mcp.exe" if os.name == "nt" else "balad-mcp")),
+    source: str(MCP_BIN_DIR / (f"{executable}.exe" if os.name == "nt" else executable))
+    for source, executable in {
+        "neshan": "neshan-mcp", "balad": "balad-mcp", "emalls": "emalls-ir-mcp",
+        "basalam": "basalam-mcp", "rasmio": "rasmio-mcp",
+    }.items()
 }
