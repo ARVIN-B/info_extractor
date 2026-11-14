@@ -26,10 +26,22 @@ def env_bool(name, default=False):
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me-before-deployment")
 DEBUG = env_bool("DJANGO_DEBUG", True)
-if not DEBUG and (SECRET_KEY == "dev-only-change-me-before-deployment" or len(SECRET_KEY) < 50):
-    raise RuntimeError("Set DJANGO_SECRET_KEY to a long random value when DJANGO_DEBUG=False.")
-ALLOWED_HOSTS = [host.strip() for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if host.strip()]
-CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if origin.strip()]
+if not DEBUG and (
+    SECRET_KEY == "dev-only-change-me-before-deployment" or len(SECRET_KEY) < 50
+):
+    raise RuntimeError(
+        "Set DJANGO_SECRET_KEY to a long random value when DJANGO_DEBUG=False."
+    )
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+    if host.strip()
+]
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -52,27 +64,35 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = "config.urls"
-TEMPLATES = [{
-    "BACKEND": "django.template.backends.django.DjangoTemplates",
-    "DIRS": [BASE_DIR / "templates"],
-    "APP_DIRS": True,
-    "OPTIONS": {"context_processors": [
-        "django.template.context_processors.request",
-        "django.contrib.auth.context_processors.auth",
-        "django.contrib.messages.context_processors.messages",
-    ]},
-}]
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ]
+        },
+    }
+]
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
-DATABASES = {"default": {
-    "ENGINE": "django.db.backends.sqlite3",
-    "NAME": os.environ.get("DATABASE_PATH", str(BASE_DIR / "db.sqlite3")),
-    "OPTIONS": {"timeout": 20},
-}}
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": os.environ.get("DATABASE_PATH", str(BASE_DIR / "db.sqlite3")),
+        "OPTIONS": {"timeout": 20},
+    }
+}
 
 AUTH_PASSWORD_VALIDATORS = [
-    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
+    },
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
@@ -93,14 +113,22 @@ CSRF_COOKIE_HTTPONLY = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", False)
-SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", "31536000" if not DEBUG else "0"))
+SECURE_HSTS_SECONDS = int(
+    os.environ.get("SECURE_HSTS_SECONDS", "31536000" if not DEBUG else "0")
+)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", not DEBUG)
 SECURE_HSTS_PRELOAD = env_bool("SECURE_HSTS_PRELOAD", False)
 SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", not DEBUG)
 CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", not DEBUG)
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL") or os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+CELERY_BROKER_URL = (
+    os.environ.get("CELERY_BROKER_URL")
+    or os.environ.get("REDIS_URL")
+    # Chabokan's Celery guide uses BROKER_URL for its Redis connection string.
+    or os.environ.get("BROKER_URL")
+    or "redis://127.0.0.1:6379/0"
+)
 if CELERY_BROKER_URL.startswith("filesystem://"):
     # Local single-machine queue for development when Redis is not installed.
     CELERY_QUEUE_DIR = BASE_DIR / "var" / "celery-broker"
@@ -129,19 +157,64 @@ SOURCE_TIMEOUT_SECONDS = int(os.environ.get("SOURCE_TIMEOUT_SECONDS", "45"))
 SOURCE_LOCK_WAIT_SECONDS = int(os.environ.get("SOURCE_LOCK_WAIT_SECONDS", "60"))
 SOURCE_MAX_CALLS_PER_JOB = int(os.environ.get("SOURCE_MAX_CALLS_PER_JOB", "40"))
 MAX_MCP_CALLS_PER_JOB = int(os.environ.get("MAX_MCP_CALLS_PER_JOB", "100"))
-SOURCE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
-SOURCE_DETAIL_CACHE_TTL_SECONDS = int(os.environ.get("SOURCE_DETAIL_CACHE_TTL_SECONDS", "86400"))
+SOURCE_RATE_LIMIT_COOLDOWN_SECONDS = int(
+    os.environ.get("SOURCE_RATE_LIMIT_COOLDOWN_SECONDS", "60")
+)
+SOURCE_DETAIL_CACHE_TTL_SECONDS = int(
+    os.environ.get("SOURCE_DETAIL_CACHE_TTL_SECONDS", "86400")
+)
 MCP_DISTRIBUTED_SOURCE_LIMITS = env_bool("MCP_DISTRIBUTED_SOURCE_LIMITS", not DEBUG)
 ENABLED_MCP_SOURCES = [
     name.strip().lower()
     for name in os.environ.get("ENABLED_MCP_SOURCES", "neshan,balad").split(",")
     if name.strip().lower() in {"neshan", "balad", "emalls", "basalam", "rasmio"}
 ]
+# MCP_BIN_DIR = BASE_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+# MCP_SERVER_PATHS = {
+#     source: str(MCP_BIN_DIR / (f"{executable}.exe" if os.name == "nt" else executable))
+#     for source, executable in {
+#         "neshan": "neshan-mcp", "balad": "balad-mcp", "emalls": "emalls-ir-mcp",
+#         "basalam": "basalam-mcp", "rasmio": "rasmio-mcp",
+#     }.items()
+# }
+
+
+import shutil
+
 MCP_BIN_DIR = BASE_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+
+
+def resolve_mcp_executable(source, executable):
+    # 1. Explicit path from environment variables
+    env_name = f"{source.upper()}_MCP_EXECUTABLE"
+    configured_path = os.environ.get(env_name)
+
+    if configured_path:
+        return configured_path
+
+    # 2. Prefer project virtual environment
+    venv_path = MCP_BIN_DIR / (f"{executable}.exe" if os.name == "nt" else executable)
+
+    if venv_path.is_file():
+        return str(venv_path)
+
+    # 3. Fall back to system PATH
+    system_path = shutil.which(executable)
+
+    if system_path:
+        return system_path
+
+    # 4. Keep expected path for a useful error if not found
+    return str(venv_path)
+
+
 MCP_SERVER_PATHS = {
-    source: str(MCP_BIN_DIR / (f"{executable}.exe" if os.name == "nt" else executable))
+    source: resolve_mcp_executable(source, executable)
     for source, executable in {
-        "neshan": "neshan-mcp", "balad": "balad-mcp", "emalls": "emalls-ir-mcp",
-        "basalam": "basalam-mcp", "rasmio": "rasmio-mcp",
+        "neshan": "neshan-mcp",
+        "balad": "balad-mcp",
+        "emalls": "emalls-ir-mcp",
+        "basalam": "basalam-mcp",
+        "rasmio": "rasmio-mcp",
     }.items()
 }

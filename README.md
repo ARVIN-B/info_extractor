@@ -167,7 +167,9 @@ cp .env.example .env
 ./.venv/bin/celery -A config beat --loglevel=INFO
 ```
 
-Gunicorn، Celery worker و Celery beat را به‌صورت سرویس‌های مستقل زیر process supervisor میزبان اجرا کن و HTTPS را در reverse proxy خاتمه بده. Beat jobهایی را که worker بیش از ۲۰ دقیقه رها کرده دوباره در صف می‌گذارد؛ برای راه‌اندازی بازیابی خودکار هر سه process لازم‌اند. چون این checkout تنظیمات میزبان تولیدی یا systemd موجودی نداشت، فایل service یا Nginx مختص سروری نامعلوم ساخته نشده است. روی Windows سرور می‌توان WSGI را با `waitress-serve --listen=127.0.0.1:8000 config.wsgi:application` در `.venv` اجرا کرد؛ Redis و worker Celery باید همچنان سرویس‌های جداگانه باشند. از SQLite روی یک میزبان و یک worker محدود استفاده کن و فایل DB را روی فایل‌سیستم پایدار نگه دار.
+Gunicorn، Celery worker و Celery beat را به‌صورت سرویس‌های مستقل زیر process supervisor میزبان اجرا کن و HTTPS را در reverse proxy خاتمه بده. Beat jobهایی را که worker بیش از ۲۰ دقیقه رها کرده دوباره در صف می‌گذارد؛ برای راه‌اندازی بازیابی خودکار هر سه process لازم‌اند. نمونهٔ آمادهٔ Supervisor برای چابکان در ادامه آمده؛ برای سایر میزبان‌ها مسیر اجرا و سرویس‌ها را متناسب با زیرساخت خود تنظیم کن. روی Windows سرور می‌توان WSGI را با `waitress-serve --listen=127.0.0.1:8000 config.wsgi:application` در `.venv` اجرا کرد؛ Redis و worker Celery باید همچنان سرویس‌های جداگانه باشند. از SQLite روی یک میزبان و یک worker محدود استفاده کن و فایل DB را روی فایل‌سیستم پایدار نگه دار.
+
+برای deploy روی چابکان، نمونهٔ Supervisor در [`supervisor.conf`](supervisor.conf) دو process worker و beat را با Python داخل `/app/.venv` اجرا می‌کند. تنظیم Redis و مراحل بررسی log در [`docs/CHABOKAN_CELERY.md`](docs/CHABOKAN_CELERY.md) آمده است. پروژه نام واقعی `config` را حفظ می‌کند و یک ورودی سازگاری `app` برای دستور راهنمای چابکان فراهم می‌کند.
 
 Health check عمومی `GET /health/` متن `ok` می‌دهد و شامل اطلاعاتی از سیستم نیست. خطاهای فنی در log سرور نگه‌داری می‌شوند؛ متن exception نامنتظره به کاربر نمایش داده نمی‌شود.
 
