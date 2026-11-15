@@ -8,6 +8,22 @@
 
 `supervisor.conf` runs the worker and beat under `/app` using the system interpreter `/usr/local/bin/python`; no project virtualenv is used on the server. If that path differs on the host, update both commands. After deploy/restart, check the `celery` and `celery-beat` logs for Redis connectivity, worker readiness, and the recovery schedule.
 
+## اجرای migration در هر deploy
+
+لاگ چابکان نصب پکیج‌ها و `collectstatic` را نشان می‌دهد، اما migration دیتابیس را خودکار اجرا نمی‌کند. پس از deploy کد و قبل از استفاده از سایت، در Shell/Console چابکان این فرمان را اجرا کنید:
+
+```bash
+cd /app && /usr/local/bin/python manage.py migrate --noinput
+```
+
+برای اطمینان از ثبت migration جدید:
+
+```bash
+cd /app && /usr/local/bin/python manage.py showmigrations leads
+```
+
+در خروجی باید `0006_searchjob_celery_task_id_alter_searchjob_status_and_more` با `[X]` دیده شود. سپس سرویس را restart کنید. این فرمان schema دیتابیس را به‌صورت افزایشی به‌روز می‌کند و داده‌ها را پاک نمی‌کند. مسیر `/app` و interpreter را مطابق مسیر واقعی پروژه در پنل تنظیم کنید.
+
 صف جست‌وجو را worker پردازش می‌کند؛ روشن بودن وب‌سرویس به‌تنهایی کافی نیست. برای پردازش صف فقط worker لازم است، اما beat برای زمان‌بندی بازیابی خودکار jobهایی که worker رها کرده لازم است. اجرای هم‌زمان Redis، worker و وب‌سرویس باید در همان محیط deploy انجام شود.
 
 در اجرای محلی ویندوز و لینوکس، به‌جای Supervisor از فرمان‌های `.venv` ثبت‌شده در README استفاده کنید. نتیجهٔ جست‌وجو در SQLite ذخیره می‌شود؛ مسیر DB باید روی دیسک پایدار deploy باشد.

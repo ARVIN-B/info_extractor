@@ -40,6 +40,7 @@ SOURCE_REGISTRY = {
         "fields": ["name", "category", "address", "phone", "website", "location"],
         "coverage": "شهرهای تحت پوشش ابزار بلد",
         "access": "unofficial public read-only MCP",
+        "detail_min_interval_seconds": float(settings.BALAD_DETAIL_MIN_INTERVAL_SECONDS),
     },
     "emalls": {
         "package": "emalls-ir-mcp==0.2.0",

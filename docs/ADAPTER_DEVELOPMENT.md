@@ -18,7 +18,8 @@
 
 ## عملیات و محدودیت
 
-- `SOURCE_TIMEOUT_SECONDS`, `SOURCE_MAX_CALLS_PER_JOB`, `MAX_MCP_CALLS_PER_JOB`, `SOURCE_RATE_LIMIT_COOLDOWN_SECONDS` بودجه و cooldown را کنترل می‌کنند. Queryها، مناطق بررسی‌شده و truncation هر source در `SourceExecution` ثبت می‌شوند.
+- `SOURCE_TIMEOUT_SECONDS`, `SOURCE_MAX_CALLS_PER_JOB`, `MAX_MCP_CALLS_PER_JOB`, `SOURCE_RATE_LIMIT_COOLDOWN_SECONDS` بودجه و cooldown را کنترل می‌کنند. سقف job بین منبع‌های pending رزرو می‌شود. Queryها، مناطق بررسی‌شده و truncation هر source در `SourceExecution` ثبت می‌شوند.
+- جزئیات Neshan و Balad با حداقل فاصلهٔ قابل‌تنظیم کنترل و response آن‌ها به‌طور امن cache می‌شود؛ 429 باید cooldown و حفظ نتایج جزئی را فعال کند، نه retry فشرده.
 - خطای HTTP/MCP مجاز است، اما درخواست‌های تکراری هنگام cooldown اجرا نمی‌شوند. source ممکن است در UI `partial`, `skipped` یا `failed` باشد.
 - proxy اختیاری هر source از `.env` به همان MCP فرزند پاس داده می‌شود. این برنامه CAPTCHA، ورود، paywall یا محدودیت upstream را دور نمی‌زند.
 - تغییر مدل نیازمند migration additive است. روی deploy، migration را جداگانه بازبینی و با دستور `manage.py migrate` در پنجرهٔ انتشار اعمال کن.

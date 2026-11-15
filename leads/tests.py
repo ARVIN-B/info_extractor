@@ -18,7 +18,7 @@ from .mcp_client import MCPCallResult, MCPSourceError, MCPToolClient, decode_res
 from .forms import SearchJobForm
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
-from .sources import _cached_source_detail, _store_source_detail, calculate_source_budget, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
+from .sources import _cached_source_detail, _store_source_detail, calculate_source_budget, calculate_source_call_allowance, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
 from .tasks import recover_stale_search_jobs, run_search_job
 
 
@@ -40,6 +40,12 @@ class NormalizationTests(TestCase):
         self.assertEqual(calculate_source_budget(100, 2, 100, 0), 50)
         self.assertEqual(calculate_source_budget(100, 2, 50, 1), 50)
         self.assertEqual(calculate_source_budget(1, 2, 1, 0), 1)
+
+    def test_global_mcp_call_budget_reserves_capacity_for_pending_sources(self):
+        self.assertEqual(calculate_source_call_allowance(100, 40, 5, 0, 4), 20)
+        self.assertEqual(calculate_source_call_allowance(100, 40, 5, 5, 3), 35)
+        self.assertEqual(calculate_source_call_allowance(100, 40, 5, 80, 0), 20)
+        self.assertEqual(calculate_source_call_allowance(100, 40, 2, 0, 1), 40)
 
     def test_generic_trade_variants_normalize_persian_plural_and_shop_wording(self):
         self.assertEqual(get_trade_variants("شیشه فروشی های"), ["شیشه فروشی", "فروشگاه شیشه", "شیشه سرای"])
@@ -478,6 +484,14 @@ class MCPClientTests(TestCase):
         client = MCPToolClient("neshan", session, {"ns_place": tool})
         with patch("leads.mcp_client.asyncio.sleep", new_callable=AsyncMock) as sleep:
             asyncio.run(client.call("ns_place", {"place_id": "place-1"}))
+        sleep.assert_awaited_once_with(6.0)
+
+    def test_balad_place_details_are_spaced(self):
+        tool = SimpleNamespace(input_schema={"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]})
+        session = SimpleNamespace(call_tool=AsyncMock(return_value=SimpleNamespace(isError=False, structuredContent={"id": "place-1"})))
+        client = MCPToolClient("balad", session, {"bl_place": tool})
+        with patch("leads.mcp_client.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            asyncio.run(client.call("bl_place", {"id": "place-1"}))
         sleep.assert_awaited_once_with(6.0)
 
     def test_schema_validation_and_allowed_tools(self):

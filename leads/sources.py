@@ -126,6 +126,19 @@ def calculate_source_budget(max_results, selected_source_count, remaining_result
     return remaining_results
 
 
+def calculate_source_call_allowance(max_total_calls, max_source_calls, selected_source_count, calls_already_used, other_pending_sources):
+    """Reserve a fair share for pending sources while reclaiming unused capacity."""
+    per_source_reserve = min(
+        max_source_calls,
+        math.ceil(max_total_calls / max(1, selected_source_count)),
+    )
+    reserved_for_others = per_source_reserve * max(0, other_pending_sources)
+    return min(
+        max_source_calls,
+        max(0, max_total_calls - calls_already_used - reserved_for_others),
+    )
+
+
 def _records(data):
     if isinstance(data, dict):
         for key in ("results", "places", "businesses", "items", "shops", "vendors", "companies", "offers", "products"):
@@ -589,10 +602,25 @@ async def _search_source(source, job, execution):
         job_calls = await sync_to_async(
             lambda: sum(job.source_executions.values_list("request_count", flat=True)), thread_sensitive=True
         )()
-        if job_calls >= settings.MAX_MCP_CALLS_PER_JOB:
+        other_pending_sources = await sync_to_async(
+            lambda: job.source_executions.filter(
+                status__in=[SourceExecution.Status.QUEUED, SourceExecution.Status.RUNNING]
+            ).exclude(pk=execution.pk).count(),
+            thread_sensitive=True,
+        )()
+        source_call_allowance = calculate_source_call_allowance(
+            settings.MAX_MCP_CALLS_PER_JOB,
+            settings.SOURCE_MAX_CALLS_PER_JOB,
+            len(job.selected_sources),
+            job_calls,
+            other_pending_sources,
+        )
+        if job_calls >= settings.MAX_MCP_CALLS_PER_JOB or client.request_count >= source_call_allowance:
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
-            raise MCPSourceError("Job reached its configured total MCP call budget; remaining coverage is truncated.")
+            raise MCPSourceError(
+                f"{source} reached its fair share of the job call budget; remaining calls are reserved for other selected sources."
+            )
         if client.request_count >= settings.SOURCE_MAX_CALLS_PER_JOB:
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
