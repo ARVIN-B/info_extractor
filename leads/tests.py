@@ -18,7 +18,7 @@ from .mcp_client import MCPCallResult, MCPSourceError, MCPToolClient, decode_res
 from .forms import SearchJobForm
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
-from .sources import _cached_source_detail, _store_source_detail, calculate_source_budget, execute_source, get_scope_points, get_trade_variants, is_relevant_trade_record, save_lead, source_skip_reason
+from .sources import _cached_source_detail, _store_source_detail, calculate_source_budget, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
 from .tasks import recover_stale_search_jobs, run_search_job
 
 
@@ -67,21 +67,11 @@ class NormalizationTests(TestCase):
         self.assertTrue(form.is_valid(), form.errors)
         self.assertEqual(form.cleaned_data["geographic_scope_name"], "اصفهان")
 
-    def test_source_planner_keeps_maps_and_explains_incompatible_catalog_sources(self):
-        self.assertEqual(source_skip_reason("کافه", "neshan"), "")
-        self.assertIn("فروشگاه", source_skip_reason("کافه", "emalls"))
-        self.assertIn("شرکت", source_skip_reason("کافه", "rasmio"))
-        self.assertEqual(source_skip_reason("فروشگاه اینترنتی لوازم خانگی", "emalls"), "")
-
-    def test_incompatible_source_is_marked_skipped_without_starting_mcp(self):
-        user = get_user_model().objects.create_user(username="planner", password="pass12345")
-        job = SearchJob.objects.create(owner=user, trade_name="کافه", geographic_scope_type="city", geographic_scope_name="تهران", selected_sources=["emalls"])
-        execution = SourceExecution.objects.create(search_job=job, source_name="emalls")
-        with patch("leads.sources.source_session", side_effect=AssertionError("irrelevant source must not start")):
-            self.assertEqual(execute_source("emalls", job, execution), 0)
-        execution.refresh_from_db()
-        self.assertEqual(execution.status, SourceExecution.Status.SKIPPED)
-        self.assertIn("فروشگاه", execution.error_details)
+    def test_catalog_sources_get_closest_source_specific_search_variants(self):
+        self.assertIn("فروشگاه کافه", get_source_query_variants("کافه", "emalls"))
+        self.assertIn("محصولات کافه", get_source_query_variants("کافه", "basalam"))
+        self.assertIn("شرکت کافه", get_source_query_variants("کافه", "rasmio"))
+        self.assertEqual(get_source_query_variants("کافه", "neshan"), ["کافه"])
 
     def test_adapter_maps_only_schema_supported_search_arguments(self):
         tool = SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "city": {"type": "string"}, "page_size": {"type": "integer"}}, "required": ["query"]})
@@ -194,6 +184,37 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(execution.error_count, 1)
         self.assertIn("detail endpoint unavailable", execution.error_details)
         self.assertEqual(SourceToolCall.objects.filter(source_execution=execution, error_summary__gt="").count(), 1)
+
+    def test_neshan_missing_place_details_uses_search_data_and_caches_the_miss(self):
+        self.job.trade_name = "کافه"
+        self.job.selected_sources = ["neshan"]
+        self.job.max_results = 1
+        self.job.save(update_fields=["trade_name", "selected_sources", "max_results"])
+        execution = SourceExecution.objects.create(search_job=self.job, source_name="neshan")
+        identifier = "e" * 32
+
+        class FakeClient:
+            request_count = 0
+
+            async def call(self, tool_name, arguments):
+                self.request_count += 1
+                if tool_name == "ns_search":
+                    return MCPCallResult({"results": [{"id": identifier, "name": "کافه نمونه", "phone": "02112345678", "address": "تهران"}]}, 1)
+                raise MCPSourceError("Neshan returned no details for this place. Check the id; get ids from ns_search.")
+
+        @asynccontextmanager
+        async def fake_session(source, **kwargs):
+            yield FakeClient()
+
+        with patch("leads.sources.source_session", fake_session):
+            self.assertEqual(execute_source("neshan", self.job, execution), 1)
+        execution.refresh_from_db()
+        lead = self.job.leads.get()
+        self.assertEqual(lead.phone_numbers, ["02112345678"])
+        self.assertEqual(execution.status, SourceExecution.Status.COMPLETED)
+        self.assertEqual(execution.error_count, 0)
+        self.assertIn("جزئیات نشان موجود نبود", execution.error_details)
+        self.assertEqual(_cached_source_detail("neshan", identifier), {})
 
     def test_cached_place_detail_avoids_another_upstream_detail_call(self):
         self.job.trade_name = "کافه"
@@ -605,6 +626,7 @@ class JobAndExportTests(TestCase):
     def test_new_search_enqueues_job_without_running_work_in_request(self):
         self.client.force_login(self.user)
         with patch("leads.views.run_search_job.delay") as enqueue:
+            enqueue.return_value.id = "celery-task-123"
             response = self.client.post(reverse("search"), {
                 "trade_name": "طلافروشی", "geographic_scope_type": "city", "geographic_scope_name": "تهران",
                 "sources": ["neshan", "balad"], "max_results": 20,
@@ -613,7 +635,39 @@ class JobAndExportTests(TestCase):
         created = SearchJob.objects.exclude(pk=self.job.pk).get()
         enqueue.assert_called_once_with(created.pk)
         self.assertEqual(created.status, SearchJob.Status.QUEUED)
+        self.assertEqual(created.celery_task_id, "celery-task-123")
         self.assertEqual(created.source_executions.count(), 2)
+
+    def test_cancel_job_records_status_and_revokes_its_celery_task(self):
+        self.client.force_login(self.user)
+        self.job.celery_task_id = "celery-task-to-cancel"
+        self.job.save(update_fields=["celery_task_id"])
+        self.assertContains(self.client.get(reverse("job_detail", args=[self.job.pk])), "لغو جست‌وجو")
+        with patch("config.celery.app.control.revoke") as revoke:
+            response = self.client.post(reverse("cancel_job", args=[self.job.pk]))
+        self.assertEqual(response.status_code, 302)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, SearchJob.Status.CANCELLED)
+        self.assertTrue(self.job.completed_at)
+        self.assertEqual(self.job.leads.count(), 1)
+        self.assertTrue(all(item.status == SourceExecution.Status.CANCELLED for item in self.job.source_executions.all()))
+        revoke.assert_called_once_with("celery-task-to-cancel", terminate=False, signal="SIGTERM")
+
+    def test_cancelled_job_does_not_start_source_work(self):
+        self.job.status = SearchJob.Status.CANCELLED
+        self.job.save(update_fields=["status"])
+        with patch("leads.tasks.execute_source", side_effect=AssertionError("cancelled job must not execute")):
+            result = run_search_job.apply(args=(self.job.pk,)).get()
+        self.assertEqual(result["status"], SearchJob.Status.CANCELLED)
+
+    def test_cancel_running_job_requests_worker_termination(self):
+        self.job.status = SearchJob.Status.RUNNING
+        self.job.celery_task_id = "active-celery-task"
+        self.job.save(update_fields=["status", "celery_task_id"])
+        self.client.force_login(self.user)
+        with patch("config.celery.app.control.revoke") as revoke:
+            self.client.post(reverse("cancel_job", args=[self.job.pk]))
+        revoke.assert_called_once_with("active-celery-task", terminate=True, signal="SIGTERM")
 
     def test_filters_work_with_sqlite_json_fields(self):
         self.client.force_login(self.user)
@@ -635,6 +689,7 @@ class JobAndExportTests(TestCase):
         self.executions[0].status = SourceExecution.Status.COMPLETED
         self.executions[0].save(update_fields=["status"])
         with patch("leads.tasks.run_search_job.delay") as enqueue:
+            enqueue.return_value.id = "recovered-task"
             result = recover_stale_search_jobs.apply().get()
         self.assertEqual(result["requeued"], 1)
         enqueue.assert_called_once_with(self.job.pk)

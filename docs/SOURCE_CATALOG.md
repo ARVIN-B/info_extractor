@@ -4,6 +4,7 @@
 
 | منبع | ابزارهای بررسی‌شده/استفاده‌شده | فیلدهای واقع‌بینانه | پوشش و محدودیت | وضعیت این checkout |
 |---|---|---|---|---|
+
 | Neshan | `ns_search`, `ns_place` | نام، دسته، موقعیت، نشانی و تماس اگر خروجی عمومی بدهد؛ سایت فقط از فیلد صریح وب‌سایت | POI نقشه، سقف ابزار و محدودیت جغرافیایی؛ `ns_place` می‌تواند 429 بدهد | فعال؛ cooldown پایدار؛ live job در ۲۰۲۶-۱۱-۱۱ تعداد ۳۰ نتیجهٔ خام گرفت و سپس جزئیات با 429 محدود شد |
 | Balad | `bl_nearby`, `bl_search`, `bl_place` | نام، دسته، نشانی، موقعیت و تماس اگر ارائه شود؛ سایت فقط از فیلد صریح وب‌سایت | POI نقشه؛ جست‌وجوی صنف با nearby؛ جغرافیا/تعداد نتیجه محدود | فعال؛ در live job نمونه ۲۰ نتیجهٔ خام برگشت |
 | Emalls | `em_search` → `em_offers` → `em_shop`; `em_shops` برای resolve نام فروشگاه | نام فروشگاه، تلفن/نشانی/وب‌سایت فقط اگر پروفایل ارائه کند | فروشنده‌های حاضر در مقایسه‌گر قیمت؛ جست‌وجو از محصول به offer فروشگاه می‌رسد، بانک کامل اصناف نیست | فعال؛ package در `.venv` و schema زنده تأیید؛ smoke جست‌وجو موفق |
@@ -35,3 +36,5 @@
 - [Rasmio MCP](https://github.com/sepehr071/rasmio-mcp)
 - [Torob MCP](https://github.com/sepehr071/torob-mcp)
 - [Neshan MCP](https://github.com/sepehr071/neshan-mcp)
+
+For Emalls, Basalam, and Rasmio, the planner now tries source-specific nearby query variants instead of marking the source irrelevant and skipping it. The exact attempted phrases are recorded on the source card. Marketplace and registry matches can be related alternatives rather than the same type of storefront; interpret each result using its source and business category.

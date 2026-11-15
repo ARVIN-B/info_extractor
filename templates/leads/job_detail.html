@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 {% block title %}نتایج جست‌وجو | سرنخ‌یاب{% endblock %}
 {% block content %}
+{% if job.status == 'queued' or job.status == 'running' %}<form method="post" action="{% url 'cancel_job' job.pk %}" class="cancel-job-form">{% csrf_token %}<button type="submit" class="button cancel-button">لغو جست‌وجو</button></form>{% endif %}
 {% if job.status == 'queued' or job.status == 'running' %}<meta http-equiv="refresh" content="5">{% endif %}
 <a class="back-link" href="{% url 'search' %}">→ بازگشت به جست‌وجوها</a>
 <section class="job-header card"><div class="job-title"><div><p class="eyebrow">{{ job.get_geographic_scope_type_display }} · {{ job.geographic_scope_name }}</p><h1>{{ job.trade_name }}</h1><p class="muted">ثبت‌شده در {{ job.created_at|date:'Y/m/d H:i' }}</p></div><span class="status-pill large {{ job.status }}">{{ job.get_status_display }}</span></div>

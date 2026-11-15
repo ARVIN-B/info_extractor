@@ -19,6 +19,10 @@ from .normalization import normalize_phone, normalize_text, normalize_website, p
 
 logger = logging.getLogger(__name__)
 
+
+class SearchCancelled(Exception):
+    """Stop collecting safely after the user cancels a job."""
+
 # Neshan documents these 23 city centers as valid `near` points.
 CITY_CENTERS = {
     "تهران": (35.6892, 51.3890), "مشهد": (36.2972, 59.6067), "اصفهان": (32.6546, 51.6680),
@@ -245,11 +249,11 @@ def _cached_source_detail(source, record_id):
 
 
 @transaction.atomic
-def _store_source_detail(source, record_id, detail):
-    if not isinstance(detail, dict) or not detail:
+def _store_source_detail(source, record_id, detail, cache_empty=False):
+    if not isinstance(detail, dict) or (not detail and not cache_empty):
         return
     safe_detail = _safe_source_response(detail)
-    if not safe_detail:
+    if not safe_detail and not cache_empty:
         return
     ttl = settings.SOURCE_DETAIL_CACHE_TTL_SECONDS
     if ttl <= 0:
@@ -466,21 +470,20 @@ def _remember_source_rate_limit(source, error):
     return state.cooldown_until
 
 
-def source_skip_reason(trade_name, source):
-    """Use source capabilities to avoid irrelevant catalog calls and expose why they were skipped."""
+def get_source_query_variants(trade_name, source):
+    """Add source-specific nearby searches instead of excluding a catalog source."""
     query = normalize_text(trade_name)
-    if source in {"neshan", "balad"}:
-        return ""
     online = any(term in query for term in ("فروشگاه اینترنتی", "فروشگاه آنلاین", "آنلاین", "اینترنتی", "مارکت پلیس"))
     small_market = any(term in query for term in ("باسلام", "صنایع دستی", "خانگی", "دست ساز", "محصولات محلی"))
     company = any(term in query for term in ("شرکت", "سهامی", "حقوقی", "ثبت شده", "نرم افزار", "فناوری", "صنعتی", "تولیدی", "کارخانه"))
+    variants = get_trade_variants(trade_name)
     if source == "emalls" and not online:
-        return "این منبع برای فروشگاه‌های آنلاین/فروشگاهی مناسب است؛ در این جست‌وجو انتخاب نشد."
-    if source == "basalam" and not (online or small_market):
-        return "این منبع فروشندگان بازارگاه را پوشش می‌دهد و برای صنف واردشده تناسب کافی ندارد."
-    if source == "rasmio" and not company:
-        return "این منبع فقط برای کشف و تکمیل هویت شرکت‌های ثبت‌شده به‌کار می‌رود."
-    return ""
+        variants.extend(f"فروشگاه {item}" for item in variants[:2])
+    elif source == "basalam" and not (online or small_market):
+        variants.extend(f"محصولات {item}" for item in variants[:2])
+    elif source == "rasmio" and not company:
+        variants.extend(f"شرکت {item}" for item in variants[:2])
+    return list(dict.fromkeys(item.strip() for item in variants if item.strip()))[:5]
 
 
 async def _search_catalog_source(source, job, execution, adapter, client, invoke, source_budget, variants):
@@ -545,7 +548,7 @@ async def _search_source(source, job, execution):
     geocode_tool = config["tools"]["search"]
     search_tool = config["tools"].get("nearby", geocode_tool)
     detail_tool = config["tools"]["detail"]
-    variants = get_trade_variants(job.trade_name)
+    variants = get_source_query_variants(job.trade_name, source)
     scope_points = get_scope_points(job)
     remaining = max(0, job.max_results - await sync_to_async(job.leads.count, thread_sensitive=True)())
     if remaining == 0:
@@ -553,17 +556,18 @@ async def _search_source(source, job, execution):
         execution.completed_at = timezone.now()
         await sync_to_async(execution.save, thread_sensitive=True)()
         return 0
-    relevant_sources = [name for name in job.selected_sources if not source_skip_reason(job.trade_name, name)]
-    relevant_source_count = max(1, len(relevant_sources))
+    selected_sources = list(dict.fromkeys(job.selected_sources))
+    relevant_source_count = max(1, len(selected_sources))
     prior_executions = await sync_to_async(
         lambda: job.source_executions.filter(
-            source_name__in=relevant_sources, status=SourceExecution.Status.COMPLETED
+            source_name__in=selected_sources, status=SourceExecution.Status.COMPLETED
         ).exclude(source_name=source).count(), thread_sensitive=True
     )()
     source_budget = calculate_source_budget(job.max_results, relevant_source_count, remaining, prior_executions)
     processed_ids = set()
     saved = 0
     detail_errors = []
+    detail_warnings = []
     detail_rate_limited = False
 
     cooldown = await sync_to_async(_active_source_cooldown, thread_sensitive=True)(source)
@@ -576,6 +580,12 @@ async def _search_source(source, job, execution):
         return 0
 
     async def invoke(client, tool_name, arguments):
+        cancelled = await sync_to_async(
+            lambda: SearchJob.objects.filter(pk=job.pk, status=SearchJob.Status.CANCELLED).exists(),
+            thread_sensitive=True,
+        )()
+        if cancelled:
+            raise SearchCancelled
         job_calls = await sync_to_async(
             lambda: sum(job.source_executions.values_list("request_count", flat=True)), thread_sensitive=True
         )()
@@ -605,6 +615,12 @@ async def _search_source(source, job, execution):
             source_execution=execution, tool_name=tool_name, duration_ms=result.duration_ms,
             result_count=len(_records(result.data)),
         )
+        cancelled = await sync_to_async(
+            lambda: SearchJob.objects.filter(pk=job.pk, status=SearchJob.Status.CANCELLED).exists(),
+            thread_sensitive=True,
+        )()
+        if cancelled:
+            raise SearchCancelled
         return result
 
     async with source_session(source, enforce_rate_limit=True) as client:
@@ -674,14 +690,16 @@ async def _search_source(source, job, execution):
                                 await sync_to_async(_store_source_detail, thread_sensitive=True)(source, identifier, detail_data)
                         except MCPSourceError as exc:
                             detail_data = {}
-                            detail_errors.append(f"{identifier}: {exc}")
-                            if exc.rate_limited:
-                                detail_rate_limited = True
-                            execution.error_count += 1
-                            execution.error_details = "\n".join(detail_errors)[-2000:]
-                            await sync_to_async(execution.save, thread_sensitive=True)(
-                                update_fields=["request_count", "error_count", "error_details"]
-                            )
+                            if source == "neshan" and re.search(r"returned no details|no details for this place", str(exc), re.IGNORECASE):
+                                detail_warnings.append(f"{identifier}: جزئیات نشان موجود نبود؛ اطلاعات نتیجهٔ جست‌وجو استفاده شد.")
+                                await sync_to_async(_store_source_detail, thread_sensitive=True)(source, identifier, {}, cache_empty=True)
+                            else:
+                                detail_errors.append(f"{identifier}: {exc}")
+                                if exc.rate_limited:
+                                    detail_rate_limited = True
+                                execution.error_count += 1
+                            execution.error_details = "\n".join([*detail_errors, *detail_warnings])[-2000:]
+                            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "error_count", "error_details"])
                     execution.request_count = client.request_count
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
                     record["_searched_city"] = place_name
@@ -706,18 +724,17 @@ async def _search_source(source, job, execution):
 
 
 def execute_source(source, job, execution):
-    reason = source_skip_reason(job.trade_name, source)
-    if reason:
-        execution.status = SourceExecution.Status.SKIPPED
-        execution.completed_at = timezone.now()
-        execution.error_details = reason
-        execution.save(update_fields=["status", "completed_at", "error_details"])
-        return 0
     execution.status = SourceExecution.Status.RUNNING
     execution.started_at = timezone.now()
     execution.save(update_fields=["status", "started_at"])
     try:
         return asyncio.run(_search_source(source, job, execution))
+    except SearchCancelled:
+        execution.status = SourceExecution.Status.CANCELLED
+        execution.completed_at = timezone.now()
+        execution.error_details = "جست‌وجو به درخواست کاربر لغو شد؛ نتایج جمع‌آوری‌شده حفظ شدند."
+        execution.save(update_fields=["status", "completed_at", "error_details", "request_count"])
+        return 0
     except Exception as exc:
         logger.exception("Search source %s failed for job %s", source, job.pk)
         if isinstance(exc, MCPSourceError) and exc.rate_limited:

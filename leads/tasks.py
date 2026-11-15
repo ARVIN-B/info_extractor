@@ -30,6 +30,8 @@ def run_search_job(self, job_id):
         ordered_sources = list(dict.fromkeys(job.selected_sources))
         ordered_sources.extend(name for name in executions if name not in ordered_sources)
         for source_name in ordered_sources:
+            if SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.CANCELLED).exists():
+                return {"status": SearchJob.Status.CANCELLED, "leads": job.leads.count()}
             execution = executions.get(source_name)
             if execution is None:
                 continue
@@ -52,11 +54,23 @@ def run_search_job(self, job_id):
         job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
         job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
         job.completed_at = timezone.now()
-        job.save(update_fields=["status", "completed_at", "error_summary", "total_raw_results", "total_unique_businesses", "total_errors"])
+        updated = SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.RUNNING).update(
+            status=job.status,
+            completed_at=job.completed_at,
+            error_summary=job.error_summary,
+            total_raw_results=job.total_raw_results,
+            total_unique_businesses=job.total_unique_businesses,
+            total_errors=job.total_errors,
+        )
+        if not updated:
+            job.refresh_from_db(fields=["status"])
+            return {"status": job.status, "leads": job.leads.count()}
         return {"status": job.status, "leads": job.total_unique_businesses, "errors": job.total_errors}
     except Exception:
         logger.exception("Search job %s failed", job_id)
         job.refresh_from_db()
+        if job.status == SearchJob.Status.CANCELLED:
+            return {"status": job.status, "leads": job.leads.count()}
         job.status = SearchJob.Status.FAILED
         job.completed_at = timezone.now()
         job.error_summary = "جست‌وجو به‌دلیل خطای داخلی متوقف شد. جزئیات فنی در گزارش سرور ثبت شده است."
@@ -82,5 +96,8 @@ def recover_stale_search_jobs():
             job.source_executions.filter(status__in=[SourceExecution.Status.RUNNING, SourceExecution.Status.FAILED]).update(
                 status=SourceExecution.Status.QUEUED, started_at=None, completed_at=None,
             )
-        run_search_job.delay(job_id)
+        queued_task = run_search_job.delay(job_id)
+        SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.QUEUED).update(
+            celery_task_id=queued_task.id
+        )
     return {"requeued": len(stale_ids)}

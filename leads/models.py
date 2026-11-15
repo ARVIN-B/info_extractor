@@ -12,6 +12,7 @@ class SearchJob(models.Model):
     class Status(models.TextChoices):
         QUEUED = "queued", "در صف"
         RUNNING = "running", "در حال اجرا"
+        CANCELLED = "cancelled", "لغوشده"
         PARTIAL = "partial", "تکمیل با خطا"
         COMPLETED = "completed", "تکمیل‌شده"
         FAILED = "failed", "ناموفق"
@@ -23,6 +24,7 @@ class SearchJob(models.Model):
     selected_sources = models.JSONField(default=list)
     max_results = models.PositiveSmallIntegerField(default=100)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.QUEUED)
+    celery_task_id = models.CharField(max_length=255, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     total_raw_results = models.PositiveIntegerField(default=0)
@@ -42,6 +44,7 @@ class SourceExecution(models.Model):
     class Status(models.TextChoices):
         QUEUED = "queued", "در صف"
         RUNNING = "running", "در حال اجرا"
+        CANCELLED = "cancelled", "لغوشده"
         PARTIAL = "partial", "نیمه‌کامل"
         SKIPPED = "skipped", "موقتاً متوقف"
         COMPLETED = "completed", "تکمیل‌شده"

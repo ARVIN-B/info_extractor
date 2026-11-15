@@ -6,7 +6,7 @@
 
 در متغیرهای محیطی سرویس، آدرس Redis چابکان را به یکی از نام‌های `CELERY_BROKER_URL`، `REDIS_URL` یا `BROKER_URL` اضافه کنید. اولویت با `CELERY_BROKER_URL` است. آدرس باید از داخل محیط اپ به Redis قابل دسترس باشد. در production از `filesystem://` استفاده نکنید.
 
-`supervisor.conf` را در ریشهٔ deploy قرار دهید تا Supervisor هم worker صف جست‌وجو و هم beat بازیابی jobهای رهاشده را اجرا کند. تنظیمات برای ریشهٔ `/app` در چابکان و نصب وابستگی‌ها در `/app/.venv` نوشته شده‌اند. اگر مسیر پروژه در میزبان متفاوت است، `directory`، فرمان‌ها و مسیر log را با همان مسیر واقعی هماهنگ کنید. پس از deploy/restart، در logهای `celery` باید اتصال به Redis و آماده‌شدن worker دیده شود؛ در `celery-beat` باید زمان‌بندی task بازیابی نمایش داده شود.
+`supervisor.conf` runs the worker and beat under `/app` using the system interpreter `/usr/local/bin/python`; no project virtualenv is used on the server. If that path differs on the host, update both commands. After deploy/restart, check the `celery` and `celery-beat` logs for Redis connectivity, worker readiness, and the recovery schedule.
 
 صف جست‌وجو را worker پردازش می‌کند؛ روشن بودن وب‌سرویس به‌تنهایی کافی نیست. برای پردازش صف فقط worker لازم است، اما beat برای زمان‌بندی بازیابی خودکار jobهایی که worker رها کرده لازم است. اجرای هم‌زمان Redis، worker و وب‌سرویس باید در همان محیط deploy انجام شود.
 

@@ -5,9 +5,11 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.paginator import Paginator
+from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
+from django.views.decorators.http import require_POST
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -41,7 +43,9 @@ def search(request):
             )
             SourceExecution.objects.bulk_create([SourceExecution(search_job=job, source_name=source) for source in job.selected_sources])
             try:
-                run_search_job.delay(job.pk)
+                queued_task = run_search_job.delay(job.pk)
+                job.celery_task_id = queued_task.id
+                job.save(update_fields=["celery_task_id"])
             except Exception:
                 job.status = SearchJob.Status.FAILED
                 job.completed_at = timezone.now()
@@ -101,6 +105,45 @@ def job_detail(request, job_id):
         },
         "filters": {"source": source, "city": city, "verification": verification, "has_phone": has_phone, "has_website": has_website},
     })
+
+
+@login_required
+@require_POST
+def cancel_job(request, job_id):
+    job = owned_job(request.user, job_id)
+    with transaction.atomic():
+        job = SearchJob.objects.select_for_update().get(pk=job.pk, owner=request.user)
+        if job.status not in {SearchJob.Status.QUEUED, SearchJob.Status.RUNNING}:
+            messages.info(request, "این جست‌وجو قبلاً پایان یافته است.")
+            return redirect("job_detail", job_id=job.pk)
+        was_running = job.status == SearchJob.Status.RUNNING
+        now = timezone.now()
+        SearchJob.objects.filter(
+            pk=job.pk, status__in=[SearchJob.Status.QUEUED, SearchJob.Status.RUNNING]
+        ).update(
+            status=SearchJob.Status.CANCELLED,
+            completed_at=now,
+            error_summary="جست‌وجو به درخواست کاربر لغو شد؛ نتایج جمع‌آوری‌شده حفظ شده‌اند.",
+        )
+        SourceExecution.objects.filter(
+            search_job=job,
+            status__in=[SourceExecution.Status.QUEUED, SourceExecution.Status.RUNNING],
+        ).update(
+            status=SourceExecution.Status.CANCELLED,
+            completed_at=now,
+            error_details="جست‌وجو به درخواست کاربر لغو شد.",
+        )
+    if job.celery_task_id:
+        try:
+            from config.celery import app as celery_app
+
+            celery_app.control.revoke(
+                job.celery_task_id, terminate=was_running, signal="SIGTERM"
+            )
+        except Exception:
+            pass
+    messages.success(request, "درخواست لغو ثبت شد؛ نتایج به‌دست‌آمده حفظ شدند.")
+    return redirect("job_detail", job_id=job.pk)
 
 
 @login_required

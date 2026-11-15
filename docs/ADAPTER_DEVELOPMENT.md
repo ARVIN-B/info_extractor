@@ -5,7 +5,7 @@
 3. ابزار را از schema runtime در MCP بخوان. برای query و detail از نام فیلدهای live schema استفاده کن؛ هیچ پارامتری را حدس نزن. `MCPToolClient.call` schema را پیش از هر درخواست validate می‌کند.
 4. برای workflow خاص، یک `SourceAdapter` در [adapters.py](../leads/adapters.py) پیاده کن. ابزارهای فقط‌خواندنی و لازم را صریحاً allowlist کن؛ پاسخ را به ردیف کسب‌وکار عمومی تبدیل کن، نه ردیف محصول/آگهی.
 5. خروجی adapter را از `save_lead` عبور بده تا تماس، نوع کسب‌وکار و evidence مستقل ثبت شوند. فقط فیلدهای عمومی لازم در raw evidence ذخیره می‌شوند. فیلد خالی را با مقدار حدسی پر نکن.
-6. `source_skip_reason` را برای applicability و مستندکردن دلیل skip به‌روزرسانی کن. در خطای منبع، نتایج منبع‌های دیگر و ردیف‌های قبلاً برگشته را حفظ کن.
+6. برای منبع‌هایی که تطبیق مستقیم ندارند، query variant نزدیک و صریح بساز؛ عبارت‌های اجراشده را در `query_variants` ثبت کن و تناسب تقریبی کاتالوگ را در UI توضیح بده. در خطای منبع، نتایج منبع‌های دیگر و ردیف‌های قبلاً برگشته را حفظ کن.
 7. برای 429 در fixture: `MCPSourceError` rate-limit را تشخیص می‌دهد، `SourceRateLimit` در SQLite cooldown را نگه می‌دارد، همان پاسخ جست‌وجو ذخیره می‌شود و call جدید در آن بازه skip می‌شود. هرگز برای دور زدن rate limit proxy را خودکار عوض نکن.
 8. تست‌های offline موفق/ناقص/بدون تلفن/schema/timeout/429/dedup/export را بنویس. فقط تستی که با `LIVE_MCP_TESTS=1` یا فرمان `check_mcp` اجرا می‌شود مجاز است شبکهٔ بیرونی داشته باشد.
 9. packageهای Python را فقط با `C:\Users\Arvin\Desktop\info_extractor\.venv\Scripts\python.exe -m pip install ...` نصب کن. نسخه را در `requirements.txt` پین کن. در deploy، بعد از install، `manage.py check_mcp --source <source>` و سپس migration/check/test را اجرا کن.
