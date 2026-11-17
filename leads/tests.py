@@ -3,11 +3,14 @@ import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from email.utils import format_datetime
-from io import BytesIO
+from io import BytesIO, StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.management import call_command, CommandError
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -15,7 +18,7 @@ from mcp.types import TextContent
 from openpyxl import load_workbook
 
 from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, QueraCompanyAdapter, RasmioAdapter, SnappShopAdapter, TorobShopAdapter, _arguments
-from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, decode_result
+from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, SOURCE_REGISTRY, decode_result
 from .forms import SearchJobForm
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
@@ -111,8 +114,8 @@ class NormalizationTests(TestCase):
     def test_new_source_adapters_convert_company_or_seller_records(self):
         class FakeClient:
             tools = {
-                "tb_find_shops": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "city": {"type": ["string", "null"]}, "kind": {"type": "string"}, "page": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["query"]}),
-                "job_companies": SimpleNamespace(input_schema={"type": "object", "properties": {"name": {"type": ["string", "null"]}, "site": {"type": "string"}, "page": {"type": "integer"}}}),
+                "tb_find_shops": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 80}, "city": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 40}, {"type": "null"}]}, "kind": {"type": "string", "enum": ["all", "online", "offline"]}, "page": {"type": "integer", "minimum": 0, "maximum": 50}, "limit": {"type": "integer", "minimum": 1, "maximum": 30}}, "required": ["query"]}),
+                "job_companies": SimpleNamespace(input_schema={"type": "object", "properties": {"name": {"anyOf": [{"type": "string", "maxLength": 60}, {"type": "null"}]}, "site": {"type": "string", "enum": ["all", "irantalent", "jobinja", "jobvision"]}, "page": {"type": "integer", "minimum": 1, "maximum": 500}}}),
                 "qr_companies": SimpleNamespace(input_schema={"type": "object", "properties": {"search": {"type": ["string", "null"]}, "city": {"type": ["string", "null"]}, "page": {"type": "integer"}}}),
                 "qr_company": SimpleNamespace(input_schema={"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]}),
                 "dk_search": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "page": {"type": "integer"}}, "required": ["query"]}),
@@ -121,8 +124,11 @@ class NormalizationTests(TestCase):
                 "ss_product": SimpleNamespace(input_schema={"type": "object", "properties": {"product": {"type": "string"}}, "required": ["product"]}),
             }
 
+        calls = []
+
         async def run_adapter(adapter, source):
             async def invoke(client, tool, args):
+                calls.append((source, tool, args))
                 if source == "torob":
                     return MCPCallResult({"shops": [{"shop_id": 42, "name": "فروشگاه نمونه"}]}, 1)
                 if source == "iran_jobs":
@@ -150,6 +156,10 @@ class NormalizationTests(TestCase):
         self.assertEqual(quera.records[0][0]["website"], "https://example.com")
         self.assertEqual(digikala.records[0][0]["_source_id"], "seller-1")
         self.assertEqual(snappshop.records[0][0]["name"], "فروشنده نمونه")
+        torob_args = next(args for source, tool, args in calls if source == "torob" and tool == "tb_find_shops")
+        jobs_args = next(args for source, tool, args in calls if source == "iran_jobs" and tool == "job_companies")
+        self.assertEqual(torob_args, {"query": "فروشگاه نمونه", "city": "اصفهان", "kind": "all", "page": 0, "limit": 10})
+        self.assertEqual(jobs_args, {"name": "فروشگاه نمونه", "site": "all", "page": 1})
 
     def test_rate_limit_retry_after_supports_seconds_dates_and_day_cooldowns(self):
         with self.assertRaises(MCPSourceError) as seconds:
@@ -664,6 +674,138 @@ class MCPClientTests(TestCase):
         self.assertTrue(fake_redis.lock_instance.released)
         self.assertTrue(fake_redis.closed)
         self.assertEqual(fake_redis.lock_instance.options[0], "info-extractor:mcp-source:neshan")
+
+
+class CheckMCPCommandTests(TestCase):
+    def test_mcp_package_versions_match_registry_and_requirements(self):
+        requirements = (Path(settings.BASE_DIR) / "requirements.txt").read_text(encoding="utf-8")
+        expected = {
+            "torob": "torob-mcp==0.2.2",
+            "iran_jobs": "iran-jobs-mcp==0.2.1",
+            "digikala": "digikala-mcp==0.6.2",
+            "snappshop": "snappshop-mcp==0.2.1",
+        }
+        for source, package in expected.items():
+            with self.subTest(source=source):
+                self.assertEqual(SOURCE_REGISTRY[source]["package"], package)
+                self.assertIn(package, requirements)
+                self.assertEqual(SOURCE_REGISTRY[source]["license"], "PolyForm-Noncommercial-1.0.0")
+
+    def test_torob_health_check_uses_search_adapter_without_detail_tool(self):
+        class FakeClient:
+            tools = {
+                "tb_find_shops": SimpleNamespace(input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "city": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        "kind": {"type": "string", "enum": ["all", "online", "offline"]},
+                        "page": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["query"],
+                })
+            }
+
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, tool, arguments):
+                self.calls.append((tool, arguments))
+                return MCPCallResult({"shops": [{"shop_id": "t-1", "name": "فروشگاه نمونه"}]}, 1)
+
+        client = FakeClient()
+
+        @asynccontextmanager
+        async def fake_session(source):
+            self.assertEqual(source, "torob")
+            yield client
+
+        output = StringIO()
+        with patch("leads.management.commands.check_mcp.source_session", fake_session):
+            call_command("check_mcp", source="torob", query="فروشگاه نمونه", city="شهر فرضی", stdout=output)
+        self.assertIn("torob: connected; tools=tb_find_shops; results=1; details=not available", output.getvalue())
+        self.assertEqual(client.calls, [("tb_find_shops", {
+            "query": "فروشگاه نمونه", "city": "شهر فرضی", "kind": "all", "page": 0, "limit": 1,
+        })])
+
+    def test_iran_jobs_health_check_uses_name_schema_and_reports_no_detail_tool(self):
+        class FakeClient:
+            tools = {
+                "job_companies": SimpleNamespace(input_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"anyOf": [{"type": "string", "maxLength": 60}, {"type": "null"}]},
+                        "site": {"type": "string", "enum": ["all", "irantalent", "jobinja", "jobvision"]},
+                        "page": {"type": "integer", "minimum": 1, "maximum": 500},
+                    },
+                })
+            }
+
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, tool, arguments):
+                self.calls.append((tool, arguments))
+                return MCPCallResult({"companies": [{"company_id": "co-1", "name": "شرکت نمونه"}]}, 1)
+
+        client = FakeClient()
+
+        @asynccontextmanager
+        async def fake_session(source):
+            self.assertEqual(source, "iran_jobs")
+            yield client
+
+        output = StringIO()
+        with patch("leads.management.commands.check_mcp.source_session", fake_session):
+            call_command("check_mcp", source="iran_jobs", query="شرکت نمونه", city="تهران", stdout=output)
+        self.assertIn("iran_jobs: connected; tools=job_companies; results=1; details=not available", output.getvalue())
+        self.assertEqual(client.calls, [("job_companies", {"name": "شرکت نمونه", "site": "all", "page": 1})])
+
+    def test_health_check_reports_detail_success_for_a_source_that_has_a_detail_tool(self):
+        class FakeClient:
+            tools = {
+                "em_search": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+                "em_offers": SimpleNamespace(input_schema={"type": "object", "properties": {"product_id": {"type": "string"}, "city": {"type": "string"}}}),
+                "em_shop": SimpleNamespace(input_schema={"type": "object", "properties": {"shop_id": {"type": "string"}}, "required": ["shop_id"]}),
+            }
+
+            async def call(self, tool, arguments):
+                if tool == "em_search":
+                    return MCPCallResult({"products": [{"id": "p-1"}]}, 1)
+                if tool == "em_offers":
+                    return MCPCallResult({"offers": [{"shop_id": "s-1"}]}, 1)
+                return MCPCallResult({"shop": {"name": "فروشگاه نمونه"}}, 1)
+
+        @asynccontextmanager
+        async def fake_session(source):
+            self.assertEqual(source, "emalls")
+            yield FakeClient()
+
+        output = StringIO()
+        with patch("leads.management.commands.check_mcp.source_session", fake_session):
+            call_command("check_mcp", source="emalls", query="محصول نمونه", city="تهران", stdout=output)
+        self.assertIn("emalls: connected;", output.getvalue())
+        self.assertIn("details=ok", output.getvalue())
+
+    def test_all_sources_continue_after_one_failure_and_exit_nonzero(self):
+        seen = []
+
+        async def fake_probe(command, source, query, city, point):
+            seen.append(source)
+            if source == "torob":
+                raise MCPSourceError("upstream unavailable")
+            return ["job_companies"], 1, "not available"
+
+        stdout, stderr = StringIO(), StringIO()
+        with self.settings(ENABLED_MCP_SOURCES=["torob", "iran_jobs"]):
+            with patch("leads.management.commands.check_mcp.Command._probe", new=fake_probe):
+                with self.assertRaises(CommandError) as raised:
+                    call_command("check_mcp", source="all", stdout=stdout, stderr=stderr)
+        self.assertEqual(seen, ["torob", "iran_jobs"])
+        self.assertIn("iran_jobs: connected", stdout.getvalue())
+        self.assertIn("torob: live check failed (MCPSourceError: upstream unavailable)", stderr.getvalue())
+        self.assertIn("torob", str(raised.exception))
 
 
 class JobAndExportTests(TestCase):

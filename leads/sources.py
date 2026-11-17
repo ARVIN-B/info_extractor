@@ -611,7 +611,8 @@ async def _search_source(source, job, execution):
     config = SOURCE_REGISTRY[source]
     geocode_tool = config["tools"]["search"]
     search_tool = config["tools"].get("nearby", geocode_tool)
-    detail_tool = config["tools"]["detail"]
+    detail_tool = config["tools"].get("detail")
+    
     variants = get_source_query_variants(job.trade_name, source)
     scope_points = get_scope_points(job)
     remaining = max(0, job.max_results - await sync_to_async(job.leads.count, thread_sensitive=True)())

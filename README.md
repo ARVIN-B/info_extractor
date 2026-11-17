@@ -23,11 +23,13 @@
 | ایمالز | `emalls-ir-mcp==0.2.0` | `em_search`, `em_offers`, `em_shop` | فعال؛ adapter محصول→offer→پروفایل فروشگاه؛ schema و smoke جست‌وجو بررسی شدند |
 | باسلام | `basalam-mcp==0.2.0` | `bs_search`, `bs_vendor` | فعال؛ adapter محصول→پروفایل غرفه؛ تلفن عمومی تضمین نمی‌شود؛ schema و smoke جست‌وجو بررسی شدند |
 | رسمیو | `rasmio-mcp==0.2.0` | `rs_search_companies` | فعال برای جست‌وجوی شرکت/شناسه ملی؛ schema و smoke بررسی شدند؛ پروفایل خودکار باز نمی‌شود تا سهمیهٔ مهمان حفظ شود |
-| ترب | `torob-mcp==0.2.1` | `tb_find_shops` | نصب‌شده در `.venv`؛ schema واقعی تأیید شد؛ جست‌وجوی مستقیم فروشگاه؛ MIT؛ ممکن است دسترسی ایران لازم باشد |
-| ایران جابز | `iran-jobs-mcp==0.2.0` | `job_companies` | نصب‌شده در `.venv`؛ schema واقعی تأیید شد؛ شرکت‌ها از IranTalent، Jobinja و Jobvision؛ آگهی شرکت مستقل محسوب نمی‌شود |
+| ترب | `torob-mcp==0.2.2` | `tb_find_shops` | نسخهٔ سرور تثبیت‌شده؛ schema تولیدی تأییدشده؛ جست‌وجوی مستقیم فروشگاه؛ ممکن است دسترسی ایران لازم باشد |
+| ایران جابز | `iran-jobs-mcp==0.2.1` | `job_companies` | نسخهٔ سرور تثبیت‌شده؛ schema تولیدی تأییدشده؛ شرکت‌ها از IranTalent، Jobinja و Jobvision؛ آگهی شرکت مستقل محسوب نمی‌شود |
 | کوئرا | `quera-mcp==0.2.0` | `qr_companies`, `qr_company` | نصب‌شده در `.venv`؛ schema واقعی تأیید شد؛ شرکت‌های Quera Magnet با پروفایل عمومی و جزئیات تماس در صورت انتشار؛ تمرکز فناوری |
-| دیجی‌کالا | `digikala-mcp==0.6.1` | `dk_search`, `dk_product` | نصب‌شده در `.venv`؛ schema واقعی تأیید شد؛ جست‌وجوی کالا تا پیشنهاد فروشنده؛ اطلاعات تماس مستقل تضمین نمی‌شود |
-| اسنپ‌شاپ | `snappshop-mcp==0.2.0` | `ss_search`, `ss_product` | نصب‌شده در `.venv`؛ schema واقعی تأیید شد؛ جست‌وجوی کالا تا پیشنهاد فروشنده؛ ممکن است به IP ایران نیاز باشد |
+| دیجی‌کالا | `digikala-mcp==0.6.2` | `dk_search`, `dk_product` | نسخهٔ سرور تثبیت‌شده؛ جست‌وجوی کالا تا پیشنهاد فروشنده؛ اطلاعات تماس مستقل تضمین نمی‌شود |
+| اسنپ‌شاپ | `snappshop-mcp==0.2.1` | `ss_search`, `ss_product` | نسخهٔ سرور تثبیت‌شده؛ جست‌وجوی کالا تا پیشنهاد فروشنده؛ ممکن است به IP ایران نیاز باشد |
+
+**مجوز نسخه‌های MCP:** چهار نسخهٔ جدیدِ پین‌شده در بالا تحت `PolyForm Noncommercial 1.0.0` منتشر شده‌اند. طبق توضیح ناشر، استفاده در شرکت، محصول پولی یا پروژهٔ مشتری نیازمند مجوز تجاری است؛ نسخه‌های پیش از این چهار انتشار تحت MIT بوده‌اند. چون این پروژه برای استقرار production است، مجوز نسخهٔ انتخابی را پیش از استفادهٔ تجاری بررسی کنید. جزئیات مجوز هر نسخه در صفحهٔ [Torob](https://pypi.org/project/torob-mcp/0.2.2/)، [Iran Jobs](https://pypi.org/project/iran-jobs-mcp/0.2.1/)، [Digikala](https://pypi.org/project/digikala-mcp/0.6.2/) و [SnappShop](https://pypi.org/project/snappshop-mcp/0.2.1/) ثبت شده است.
 
 پنج بستهٔ جدید داخل `.venv` نصب و schema زندهٔ ابزارهای لازم از MCP server خوانده شد؛ نصب سراسری انجام نشده است. تست schema به معنی اثبات دسترسی پایدار به وب‌سایت یا پوشش کامل نیست. منابع تازه در تنظیمات پیش‌فرض فعال‌اند؛ اگر `.env` شما `ENABLED_MCP_SOURCES` را تعیین کرده، نام‌های `torob,iran_jobs,quera,digikala,snappshop` را به همان فهرست اضافه کنید. مقدار واقعی `.env` در مستندات درج نمی‌شود.
 
@@ -140,6 +142,8 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python.exe manage.py check_mcp --source emalls --query "عسل طبیعی" --city "تهران"
 .\.venv\Scripts\python.exe manage.py check_mcp --source basalam --query "عسل طبیعی" --city "تهران"
 .\.venv\Scripts\python.exe manage.py check_mcp --source rasmio --query "شرکت مواد غذایی" --city "تهران"
+.\.venv\Scripts\python.exe manage.py check_mcp --source torob --query "فروشگاه موبایل" --city "تهران"
+.\.venv\Scripts\python.exe manage.py check_mcp --source iran_jobs --query "شرکت نرم افزاری" --city "تهران"
 ```
 
 برای نشان، فقط وقتی cooldown/rate limit فعال نیست smoke test بگیر؛ این فرمان search و جزئیات یک نتیجه را صدا می‌زند و ممکن است محدودیت `ns_place` را فعال کند:

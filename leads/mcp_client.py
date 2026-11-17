@@ -80,18 +80,20 @@ SOURCE_REGISTRY = {
         "access": "unofficial public registry MCP; guest detail quota",
     },
     "torob": {
-        "package": "torob-mcp==0.2.1", "executable": "torob-mcp", "tools": {"search": "tb_find_shops"},
+        "package": "torob-mcp==0.2.2", "executable": "torob-mcp", "tools": {"search": "tb_find_shops"},
         "proxy_env": "TOROB_MCP_PROXY", "display_name": "ترب", "kind": "marketplace_seller",
         "categories": ["online_shop", "retail", "all"], "fields": ["name", "shop_id", "public shop profile", "website when published"],
-        "coverage": "فروشگاه‌های فهرست‌شده در ترب؛ اطلاعات تماس مستقل تضمین نمی‌شود", "access": "unofficial public read-only MCP; MIT",
+        "coverage": "فروشگاه‌های فهرست‌شده در ترب؛ اطلاعات تماس مستقل تضمین نمی‌شود", "access": "unofficial public read-only MCP",
+        "license": "PolyForm-Noncommercial-1.0.0",
         "fallback_group": "online_shop", "capabilities": ["shop_search", "seller_identity"], "enabled": True,
     },
     "iran_jobs": {
-        "package": "iran-jobs-mcp==0.2.0", "executable": "iran-jobs-mcp", "tools": {"search": "job_companies"},
+        "package": "iran-jobs-mcp==0.2.1", "executable": "iran-jobs-mcp", "tools": {"search": "job_companies"},
         "proxy_env": "IRAN_JOBS_MCP_PROXY", "display_name": "ایران جابز", "kind": "recruitment_company",
         "categories": ["recruitment_company", "company", "all"], "fields": ["name", "company profile", "industry", "city", "website", "public jobs"],
         "coverage": "شرکت‌های IranTalent، Jobinja و Jobvision؛ اطلاعات تماس فقط در صورت انتشار", "access": "unofficial public read-only MCP",
         "fallback_group": "recruitment_company", "capabilities": ["company_search", "job_evidence"], "enabled": True,
+        "license": "PolyForm-Noncommercial-1.0.0",
     },
     "quera": {
         "package": "quera-mcp==0.2.0", "executable": "quera-mcp", "tools": {"search": "qr_companies", "detail": "qr_company"},
@@ -101,18 +103,20 @@ SOURCE_REGISTRY = {
         "fallback_group": "recruitment_company", "fallback_order": 2, "capabilities": ["company_search", "company_profile", "public_business_links"], "enabled": True,
     },
     "digikala": {
-        "package": "digikala-mcp==0.6.1", "executable": "digikala-mcp", "tools": {"search": "dk_search", "detail": "dk_product"},
+        "package": "digikala-mcp==0.6.2", "executable": "digikala-mcp", "tools": {"search": "dk_search", "detail": "dk_product"},
         "proxy_env": "DIGIKALA_MCP_PROXY", "display_name": "دیجی‌کالا", "kind": "marketplace_seller",
         "categories": ["online_shop", "retail", "all"], "fields": ["name", "seller_id", "public seller profile", "website when published"],
         "coverage": "فروشندگان محصولات جست‌وجوشده؛ وب‌سایت یا تلفن مستقل تضمین نمی‌شود", "access": "unofficial public read-only MCP",
         "fallback_group": "online_shop", "capabilities": ["product_search", "seller_offers"], "enabled": True,
+        "license": "PolyForm-Noncommercial-1.0.0",
     },
     "snappshop": {
-        "package": "snappshop-mcp==0.2.0", "executable": "snappshop-mcp", "tools": {"search": "ss_search", "detail": "ss_product"},
+        "package": "snappshop-mcp==0.2.1", "executable": "snappshop-mcp", "tools": {"search": "ss_search", "detail": "ss_product"},
         "proxy_env": "SNAPPSHOP_MCP_PROXY", "display_name": "اسنپ‌شاپ", "kind": "marketplace_seller",
         "categories": ["online_shop", "retail", "all"], "fields": ["name", "seller_id", "public seller profile", "website when published"],
         "coverage": "فروشندگان محصولات جست‌وجوشده؛ ممکن است به دسترسی شبکه‌ای ایران نیاز باشد", "access": "unofficial public read-only MCP",
         "fallback_group": "online_shop", "capabilities": ["product_search", "seller_offers"], "enabled": True,
+        "license": "PolyForm-Noncommercial-1.0.0",
     },
 }
 
