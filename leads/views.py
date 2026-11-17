@@ -72,13 +72,15 @@ def search(request):
 def job_detail(request, job_id):
     job = owned_job(request.user, job_id)
     queue_wait_seconds = max(0, int((timezone.now() - job.created_at).total_seconds())) if job.status == SearchJob.Status.QUEUED else 0
+    resume_at = job.source_executions.filter(status=SourceExecution.Status.LONG_COOLDOWN, cooldown_until__gt=timezone.now()).order_by("cooldown_until").values_list("cooldown_until", flat=True).first()
     leads = job.leads.all()
     source = request.GET.get("source", "")
     city = request.GET.get("city", "").strip()[:120]
     verification = request.GET.get("verification", "")
     has_phone = request.GET.get("has_phone", "") == "1"
     has_website = request.GET.get("has_website", "") == "1"
-    if source in job.selected_sources:
+    available_sources = list(job.source_executions.values_list("source_name", flat=True))
+    if source in available_sources:
         leads = leads.filter(source_names__icontains=source)
     if city:
         leads = leads.filter(city__icontains=city)
@@ -92,16 +94,20 @@ def job_detail(request, job_id):
     return render(request, "leads/job_detail.html", {
         "job": job,
         "queue_wait_seconds": queue_wait_seconds,
+        "resume_at": resume_at,
         "page_obj": page,
         "verification_choices": BusinessLead.Verification.choices,
         "phone_status_choices": BusinessLead.PhoneStatus.choices,
         "source_catalog": SOURCE_REGISTRY,
+        "available_sources": available_sources,
         "summary": {
             "with_phone": job.leads.exclude(phone_numbers=[]).count(),
             "without_phone": job.leads.filter(phone_numbers=[]).count(),
             "with_email": job.leads.exclude(emails=[]).count(),
             "with_website": job.leads.exclude(website="").count(),
-            "partial_sources": job.source_executions.filter(status__in=[SourceExecution.Status.PARTIAL, SourceExecution.Status.SKIPPED]).count(),
+            "partial_sources": job.source_executions.filter(status__in=[SourceExecution.Status.PARTIAL, SourceExecution.Status.SKIPPED, SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count(),
+            "successful_sources": job.source_executions.filter(status=SourceExecution.Status.COMPLETED).count(),
+            "limited_sources": job.source_executions.filter(status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count(),
         },
         "filters": {"source": source, "city": city, "verification": verification, "has_phone": has_phone, "has_website": has_website},
     })

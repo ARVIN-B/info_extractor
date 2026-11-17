@@ -6,7 +6,7 @@ from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, Sour
 class SourceExecutionInline(admin.TabularInline):
     model = SourceExecution
     extra = 0
-    readonly_fields = ("status", "started_at", "completed_at", "request_count", "result_count", "error_count")
+    readonly_fields = ("status", "started_at", "completed_at", "request_count", "result_count", "error_count", "error_type", "retry_count", "cooldown_until", "fallback_source")
 
 
 @admin.register(SearchJob)

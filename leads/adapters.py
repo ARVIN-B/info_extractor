@@ -45,7 +45,7 @@ def _arguments(client, tool_name, values):
     schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None) or {}
     properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
     aliases = {
-        "query": ("query", "what", "name", "activity"),
+        "query": ("query", "search", "what", "name", "activity"),
         "city": ("city",),
         "province": ("province",),
         "page": ("page",),
@@ -53,6 +53,7 @@ def _arguments(client, tool_name, values):
         "product_id": ("product_id", "product", "id"),
         "shop_id": ("shop_id", "vendor_id", "vendor", "id"),
         "company_id": ("company_id", "national_id", "id"),
+        "seller_id": ("seller_id", "seller_code", "shop_id", "vendor_id", "id"),
     }
     result = {}
     for key, value in values.items():
@@ -220,8 +221,162 @@ class RasmioAdapter(SourceAdapter):
         return AdapterResult(found, truncated)
 
 
+def _nested_rows(data, keys):
+    """Find seller/company rows in documented nested MCP result shapes."""
+    if isinstance(data, list):
+        return [row for item in data for row in _nested_rows(item, keys)]
+    if not isinstance(data, dict):
+        return []
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+    if _first(data, "company_id", "seller_id", "seller_code", "shop_id", "vendor_id", "id") and _first(data, "name", "company_name", "seller", "seller_name", "shop_name", "vendor_name", "title"):
+        return [data]
+    result = []
+    for value in data.values():
+        if isinstance(value, (dict, list)):
+            result.extend(_nested_rows(value, keys))
+    return result
+
+
+class TorobShopAdapter(SourceAdapter):
+    """Search actual shop records; no product card is misrepresented as a shop."""
+    source_id = "torob"
+    mode = "direct_shop_search"
+
+    async def discover(self, client, invoke, query, city, province, limit):
+        tool = client_source_tool(client, self.source_id, "search")
+        args = _arguments(client, tool, {"query": query, "city": city or province or None, "kind": "all", "page": 0, "limit": min(30, limit)})
+        rows = _nested_rows((await invoke(client, tool, args)).data, ("shops", "results", "stores", "items"))
+        found = []
+        for row in rows:
+            shop_id = _first(row, "shop_id", "id", "seller_id")
+            name = _first(row, "name", "shop_name", "seller_name", "title")
+            if not shop_id or not name:
+                continue
+            record = dict(row, _source_id=str(shop_id), name=name, _source_city=_first(row, "city") or city,
+                          _source_province=_first(row, "province") or province)
+            found.append((record, row))
+            if len(found) >= limit:
+                break
+        return AdapterResult(found, len(rows) >= min(30, limit))
+
+
+class MarketplaceProductAdapter(SourceAdapter):
+    """Find shops only through seller offers returned for matching products."""
+    mode = "product_search_to_seller_offers"
+    seller_keys = ("offers", "seller_offers", "product_offers", "sellers", "vendors", "shops", "merchants", "listings")
+
+    async def discover(self, client, invoke, query, city, province, limit):
+        search_tool = client_source_tool(client, self.source_id, "search")
+        detail_tool = client_source_tool(client, self.source_id, "detail")
+        search_args = _arguments(client, search_tool, {"query": query, "page": 1, "limit": min(10, limit)})
+        products = _records((await invoke(client, search_tool, search_args)).data)
+        found, seen = [], set()
+        try:
+            for product in products:
+                product_id = _first(product, "product_id", "id", "productId") if self.source_id == "snappshop" else _first(product, "id", "product_id", "productId")
+                if not product_id:
+                    continue
+                detail_values = (
+                    {"product": str(product_id)}
+                    if self.source_id == "snappshop"
+                    else {"product_id": product_id}
+                )
+                detail_args = _arguments(client, detail_tool, detail_values)
+                detail = (await invoke(client, detail_tool, detail_args)).data
+                offers = _nested_rows(detail, self.seller_keys)
+                for offer in offers:
+                    seller_id = _first(offer, "seller_id", "seller_code", "shop_id", "vendor_id", "merchant_id", "id")
+                    seller_name = _first(offer, "seller_name", "seller", "shop_name", "vendor_name", "merchant_name", "name", "title")
+                    if not seller_id or not seller_name or str(seller_id) in seen:
+                        continue
+                    seen.add(str(seller_id))
+                    row = dict(offer, _source_id=str(seller_id), name=seller_name,
+                               _source_city=_first(offer, "city") or city,
+                               _source_province=_first(offer, "province") or province)
+                    found.append((row, offer))
+                    if len(found) >= limit:
+                        return AdapterResult(found, True)
+        except MCPSourceError as exc:
+            exc.partial_records = found
+            raise
+        return AdapterResult(found, len(products) >= min(10, limit))
+
+
+class DigikalaAdapter(MarketplaceProductAdapter):
+    source_id = "digikala"
+
+
+class SnappShopAdapter(MarketplaceProductAdapter):
+    source_id = "snappshop"
+
+
+class IranJobsCompanyAdapter(SourceAdapter):
+    source_id = "iran_jobs"
+    mode = "company_search_with_job_evidence"
+
+    async def discover(self, client, invoke, query, city, province, limit):
+        tool = client_source_tool(client, self.source_id, "search")
+        args = _arguments(client, tool, {"query": query, "page": 1, "site": "all"})
+        companies = _nested_rows((await invoke(client, tool, args)).data, ("companies", "results", "items", "irantalent", "jobinja", "jobvision"))
+        found = []
+        for company in companies:
+            name = _first(company, "name", "company_name", "title")
+            identifier = _first(company, "company_id", "id", "uuid", "national_id")
+            if not identifier or not name:
+                continue
+            record = dict(company, _source_id=str(identifier), name=name,
+                          _source_city=_first(company, "city", "location") or city,
+                          _source_province=_first(company, "province") or province)
+            found.append((record, company))
+            if len(found) >= limit:
+                break
+        return AdapterResult(found, len(companies) >= limit)
+
+
+class QueraCompanyAdapter(SourceAdapter):
+    source_id = "quera"
+    mode = "company_search_and_public_profile"
+
+    async def discover(self, client, invoke, query, city, province, limit):
+        search_tool = client_source_tool(client, self.source_id, "search")
+        detail_tool = client_source_tool(client, self.source_id, "detail")
+        args = _arguments(client, search_tool, {"query": query, "city": city or province or None, "page": 1})
+        companies = _records((await invoke(client, search_tool, args)).data)
+        found, seen = [], set()
+        try:
+            for company in companies:
+                slug = _first(company, "slug", "company_id", "id")
+                name = _first(company, "name", "company_name", "title")
+                if not slug or not name or str(slug) in seen:
+                    continue
+                seen.add(str(slug))
+                profile_args = _arguments(client, detail_tool, {"slug": str(slug)})
+                profile = (await invoke(client, detail_tool, profile_args)).data
+                details = profile if isinstance(profile, dict) else {}
+                record = dict(company)
+                record.update({key: value for key, value in details.items() if value not in (None, "", [], {})})
+                record.update(_source_id=str(slug), name=_first(details, "name", "company_name") or name,
+                              _source_city=_first(details, "city") or city,
+                              _source_province=_first(details, "province") or province)
+                found.append((record, details))
+                if len(found) >= limit:
+                    return AdapterResult(found, True)
+        except MCPSourceError as exc:
+            exc.partial_records = found
+            raise
+        return AdapterResult(found, len(companies) >= limit)
+
+
 SOURCE_ADAPTERS = {
     "emalls": EmallsAdapter(),
     "basalam": BasalamAdapter(),
     "rasmio": RasmioAdapter(),
+    "torob": TorobShopAdapter(),
+    "iran_jobs": IranJobsCompanyAdapter(),
+    "quera": QueraCompanyAdapter(),
+    "digikala": DigikalaAdapter(),
+    "snappshop": SnappShopAdapter(),
 }

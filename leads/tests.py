@@ -2,6 +2,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from email.utils import format_datetime
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -13,8 +14,8 @@ from django.utils import timezone
 from mcp.types import TextContent
 from openpyxl import load_workbook
 
-from .adapters import RasmioAdapter, _arguments
-from .mcp_client import MCPCallResult, MCPSourceError, MCPToolClient, decode_result
+from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, QueraCompanyAdapter, RasmioAdapter, SnappShopAdapter, TorobShopAdapter, _arguments
+from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, decode_result
 from .forms import SearchJobForm
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
@@ -107,6 +108,60 @@ class NormalizationTests(TestCase):
         self.assertEqual(calls[0][0], "rs_search_companies")
         self.assertEqual([call[1]["page"] for call in calls], [1, 2])
 
+    def test_new_source_adapters_convert_company_or_seller_records(self):
+        class FakeClient:
+            tools = {
+                "tb_find_shops": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "city": {"type": ["string", "null"]}, "kind": {"type": "string"}, "page": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["query"]}),
+                "job_companies": SimpleNamespace(input_schema={"type": "object", "properties": {"name": {"type": ["string", "null"]}, "site": {"type": "string"}, "page": {"type": "integer"}}}),
+                "qr_companies": SimpleNamespace(input_schema={"type": "object", "properties": {"search": {"type": ["string", "null"]}, "city": {"type": ["string", "null"]}, "page": {"type": "integer"}}}),
+                "qr_company": SimpleNamespace(input_schema={"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]}),
+                "dk_search": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "page": {"type": "integer"}}, "required": ["query"]}),
+                "dk_product": SimpleNamespace(input_schema={"type": "object", "properties": {"product_id": {"type": "integer"}, "max_offers": {"type": "integer"}}, "required": ["product_id"]}),
+                "ss_search": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "page": {"type": "integer"}}, "required": ["query"]}),
+                "ss_product": SimpleNamespace(input_schema={"type": "object", "properties": {"product": {"type": "string"}}, "required": ["product"]}),
+            }
+
+        async def run_adapter(adapter, source):
+            async def invoke(client, tool, args):
+                if source == "torob":
+                    return MCPCallResult({"shops": [{"shop_id": 42, "name": "فروشگاه نمونه"}]}, 1)
+                if source == "iran_jobs":
+                    return MCPCallResult({"companies": [{"company_id": "uuid-1", "name": "شرکت نمونه", "industry": "فناوری"}]}, 1)
+                if source == "quera" and tool == "qr_companies":
+                    return MCPCallResult({"companies": [{"slug": "sample", "name": "شرکت فنی"}]}, 1)
+                if source == "quera":
+                    return MCPCallResult({"name": "شرکت فنی", "website": "https://example.com", "contacts": ["public@example.com"]}, 1)
+                if tool in {"dk_search", "ss_search"}:
+                    product = {"id": "abcdef", "product_id": 123} if source == "snappshop" else {"id": 123}
+                    return MCPCallResult({"products": [product]}, 1)
+                if source == "snappshop":
+                    self.assertEqual(args["product"], "123")
+                return MCPCallResult({"product": {"offers": [{"seller_id": "seller-1", "seller_name": "فروشنده نمونه", "website": "https://shop.example"}]}}, 1)
+            return await adapter.discover(FakeClient(), invoke, "فروشگاه نمونه", "اصفهان", "اصفهان", 10)
+
+        torob = asyncio.run(run_adapter(TorobShopAdapter(), "torob"))
+        jobs = asyncio.run(run_adapter(IranJobsCompanyAdapter(), "iran_jobs"))
+        quera = asyncio.run(run_adapter(QueraCompanyAdapter(), "quera"))
+        digikala = asyncio.run(run_adapter(DigikalaAdapter(), "digikala"))
+        snappshop = asyncio.run(run_adapter(SnappShopAdapter(), "snappshop"))
+        self.assertEqual(torob.records[0][0]["_source_id"], "42")
+        self.assertEqual(jobs.records[0][0]["_source_id"], "uuid-1")
+        self.assertEqual(quera.records[0][0]["_source_id"], "sample")
+        self.assertEqual(quera.records[0][0]["website"], "https://example.com")
+        self.assertEqual(digikala.records[0][0]["_source_id"], "seller-1")
+        self.assertEqual(snappshop.records[0][0]["name"], "فروشنده نمونه")
+
+    def test_rate_limit_retry_after_supports_seconds_dates_and_day_cooldowns(self):
+        with self.assertRaises(MCPSourceError) as seconds:
+            decode_result(type("Response", (), {"is_error": True, "content": [TextContent(type="text", text="HTTP 429 Retry-After: 7200")]})())
+        self.assertEqual(seconds.exception.retry_after_seconds, 7200)
+        retry_date = format_datetime(timezone.now() + timedelta(hours=3), usegmt=True)
+        with self.assertRaises(MCPSourceError) as date_result:
+            decode_result(type("Response", (), {"is_error": True, "content": [TextContent(type="text", text=f"429 Retry-After: {retry_date}")]})())
+        self.assertGreater(date_result.exception.retry_after_seconds, 7000)
+        self.assertEqual(MCPSourceError("rate limited; wait 1 day").retry_after_seconds, 86400)
+        self.assertEqual(MCPSourceError("daily quota exceeded").error_type, "daily_quota_exceeded")
+
 
 class LeadPersistenceTests(TransactionTestCase):
     def setUp(self):
@@ -119,7 +174,26 @@ class LeadPersistenceTests(TransactionTestCase):
         save_lead(self.job, "neshan", search, {"id": search["id"], "name": search["name"], "phones": [search["phone"]], "address": search["address"], "website": "https://example.com"})
         self.assertEqual(self.job.leads.count(), 1)
         self.assertEqual(self.job.leads.get().source_record_ids["neshan"], search["id"])
-        self.assertEqual(LeadEvidence.objects.filter(business_lead__search_job=self.job, field_name="raw_response").count(), 2)
+        self.assertEqual(LeadEvidence.objects.filter(business_lead__search_job=self.job, field_name="raw_response").count(), 1)
+
+    def test_internal_fair_share_exhaustion_is_a_non_error_terminal_source_state(self):
+        self.job.selected_sources = ["neshan"]
+        self.job.save(update_fields=["selected_sources"])
+        SourceExecution.objects.filter(search_job=self.job).exclude(source_name="neshan").delete()
+        execution = SourceExecution.objects.create(search_job=self.job, source_name="neshan")
+        class BudgetClient:
+            request_count = 1
+            async def call(self, tool_name, arguments):
+                raise MCPBudgetExhausted("reserved capacity")
+        @asynccontextmanager
+        async def fake_session(source, **kwargs):
+            yield BudgetClient()
+        with patch("leads.sources.source_session", fake_session), self.settings(MAX_MCP_CALLS_PER_JOB=1, SOURCE_MAX_CALLS_PER_JOB=10):
+            self.assertEqual(execute_source("neshan", self.job, execution), 0)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, SourceExecution.Status.BUDGET_EXHAUSTED)
+        self.assertEqual(execution.error_type, "fair_share_exhausted")
+        self.assertEqual(execution.error_count, 0)
 
     def test_map_place_url_is_provenance_not_the_business_website(self):
         search = {"id": "a" * 32, "name": "کافه آفتاب", "website": "", "address": "تهران"}
@@ -281,8 +355,8 @@ class LeadPersistenceTests(TransactionTestCase):
         execution.refresh_from_db()
         self.assertEqual(count, 2)
         self.assertEqual(client.calls, ["ns_search", "ns_place"])
-        self.assertEqual(execution.status, SourceExecution.Status.PARTIAL)
-        self.assertEqual(execution.error_count, 1)
+        self.assertEqual(execution.status, SourceExecution.Status.RATE_LIMITED)
+        self.assertEqual(execution.error_count, 0)
         self.assertIn("429", execution.error_details)
         self.assertEqual(self.job.leads.count(), 2)
         cooldown = SourceRateLimit.objects.get(source_name="neshan")
@@ -293,7 +367,7 @@ class LeadPersistenceTests(TransactionTestCase):
         with patch("leads.sources.source_session", side_effect=AssertionError("cooldown must skip startup")):
             self.assertEqual(execute_source("neshan", next_job, next_execution), 0)
         next_execution.refresh_from_db()
-        self.assertEqual(next_execution.status, SourceExecution.Status.SKIPPED)
+        self.assertEqual(next_execution.status, SourceExecution.Status.RATE_LIMITED)
 
     def test_balad_category_search_uses_nearby_and_saves_place_details(self):
         self.job.trade_name = "شیشه فروشی های"
@@ -473,7 +547,8 @@ class LeadPersistenceTests(TransactionTestCase):
         with patch("leads.sources.source_session", fake_session), patch("leads.sources.settings.MAX_MCP_CALLS_PER_JOB", 1):
             execute_source("neshan", self.job, execution)
         execution.refresh_from_db()
-        self.assertEqual(execution.status, SourceExecution.Status.PARTIAL)
+        self.assertEqual(execution.status, SourceExecution.Status.BUDGET_EXHAUSTED)
+        self.assertEqual(execution.error_count, 0)
         self.assertTrue(execution.truncated)
 
 
@@ -625,6 +700,32 @@ class JobAndExportTests(TestCase):
         with patch("leads.tasks.execute_source", side_effect=fake_execute):
             run_search_job.apply(args=(self.job.pk,)).get()
         self.assertEqual(seen, ["balad", "neshan"])
+
+    def test_rate_limited_source_uses_enabled_relevant_fallback_and_job_completes(self):
+        self.job.selected_sources = ["emalls"]
+        self.job.save(update_fields=["selected_sources"])
+        SourceExecution.objects.filter(search_job=self.job).exclude(source_name="emalls").delete()
+        SourceExecution.objects.create(search_job=self.job, source_name="emalls")
+
+        def fake_execute(source, job, execution):
+            if source == "emalls":
+                execution.status = SourceExecution.Status.RATE_LIMITED
+                execution.error_type = "rate_limit"
+            else:
+                execution.status = SourceExecution.Status.COMPLETED
+                execution.result_count = 1
+            execution.save(update_fields=["status", "error_type", "result_count"])
+            return 0
+
+        with patch("leads.tasks.execute_source", side_effect=fake_execute), self.settings(
+            ENABLED_MCP_SOURCES=["emalls", "torob"], SOURCE_FALLBACK_ENABLED=True,
+        ):
+            result = run_search_job.apply(args=(self.job.pk,)).get()
+        self.job.refresh_from_db()
+        self.assertEqual(result["status"], SearchJob.Status.COMPLETED)
+        torob = self.job.source_executions.get(source_name="torob")
+        self.assertEqual(torob.fallback_source, "emalls")
+        self.assertEqual(self.job.source_executions.get(source_name="emalls").fallback_source, "torob")
 
     def test_failed_source_with_partial_records_keeps_partial_job_state(self):
         def failed_after_results(source, job, execution):

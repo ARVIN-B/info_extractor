@@ -11,9 +11,10 @@ from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+from redis import Redis
 
 from .adapters import SOURCE_ADAPTERS
-from .mcp_client import MCPSourceError, SOURCE_REGISTRY, source_session
+from .mcp_client import MCPBudgetExhausted, MCPSourceError, SOURCE_REGISTRY, source_session
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
 
@@ -169,7 +170,7 @@ def _format_phone_values(value):
 
 def _field_values(search_record, detail):
     detail = detail if isinstance(detail, dict) else {}
-    name = _first(detail, "name", "shop_name", "vendor_name", "company_name", "title") or _first(search_record, "name", "shop_name", "vendor_name", "company_name", "title", "maintext")
+    name = _first(detail, "name", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "title") or _first(search_record, "name", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "title", "maintext")
     address = _first(detail, "address", "formatted_address") or _first(search_record, "address", "subtext1")
     # A generic `url` on map records points to the provider's place page, not
     # necessarily the business website. Keep those URLs as provenance only.
@@ -186,7 +187,7 @@ def _field_values(search_record, detail):
     emails = list(dict.fromkeys(email for email in emails if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)))
     socials = []
     for source_data in (detail, search_record):
-        value = _first(source_data, "social_links", "socials", "instagram", "telegram", "linkedin")
+        value = _first(source_data, "social_links", "socials", "social", "instagram", "telegram", "linkedin")
         if isinstance(value, dict):
             socials.extend(str(url).strip() for url in value.values() if isinstance(url, str) and url.strip())
         elif isinstance(value, list):
@@ -223,11 +224,11 @@ def _source_url(source, record_id):
 
 
 _SAFE_SOURCE_FIELDS = {
-    "id", "place_id", "token", "shop_id", "vendor_id", "company_id", "national_id", "national_code",
-    "name", "title", "maintext", "shop_name", "vendor_name", "company_name", "category", "business_category",
+    "id", "place_id", "token", "slug", "shop_id", "seller_id", "seller_code", "merchant_id", "vendor_id", "company_id", "national_id", "national_code",
+    "name", "title", "maintext", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "category", "business_category", "industry", "jobs", "company_url", "shop_url",
     "activity", "business_type", "company_type", "kind", "address", "formatted_address", "city", "province",
     "phone", "phones", "telephone", "email", "emails", "contact_email", "website", "web", "url", "profile_url",
-    "source_url", "social_links", "socials", "instagram", "telegram", "linkedin", "lat", "latitude", "lng", "lon", "longitude",
+    "source_url", "social_links", "socials", "social", "instagram", "telegram", "linkedin", "lat", "latitude", "lng", "lon", "longitude",
 }
 
 
@@ -301,14 +302,20 @@ def _find_match(job, source, record_id, data):
         same_phone = bool(candidate_phones & phones)
         _, candidate_domain = normalize_website(candidate.website)
         same_domain = bool(domain and candidate_domain and domain == candidate_domain)
-        if same_location and same_name and (same_phone or same_domain):
+        candidate_city = normalize_text(candidate.city)
+        current_city = normalize_text(data.get("city", ""))
+        address_conflict = bool(candidate.address and data["address"] and not same_location)
+        same_city_or_unknown = not candidate_city or not current_city or candidate_city == current_city
+        same_branch_address = bool(candidate.address and data["address"] and same_location and same_city_or_unknown)
+        same_contact_identity = bool(same_name and same_city_or_unknown and not address_conflict and (same_phone or same_domain))
+        if same_name and (same_branch_address or same_contact_identity):
             return candidate
     return None
 
 
 @transaction.atomic
 def save_lead(job, source, search_record, detail):
-    record_id = _first(search_record, "_source_id", "id", "place_id", "token", "shop_id", "vendor_id", "company_id", "national_id") or _first(detail if isinstance(detail, dict) else {}, "id", "place_id", "token", "shop_id", "vendor_id", "company_id", "national_id")
+    record_id = _first(search_record, "_source_id", "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id") or _first(detail if isinstance(detail, dict) else {}, "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id")
     if not record_id:
         return None
     record_id = str(record_id)
@@ -414,14 +421,10 @@ def save_lead(job, source, search_record, detail):
                 "data_type": "public_business_contact" if field_name in {"phone_numbers", "emails", "website"} else ("company_registry" if source == "rasmio" else "public_business_data"),
             },
         )
-    LeadEvidence.objects.create(
-        business_lead=lead,
-        source_name=source,
-        source_record_id=record_id,
-        field_name="raw_response",
-        field_value="Original search and detail response",
-        source_url=fields["profile_url"] or _source_url(source, record_id),
-        raw_response=raw,
+    LeadEvidence.objects.get_or_create(
+        business_lead=lead, source_name=source, source_record_id=record_id,
+        field_name="raw_response", field_value="Original search and detail response",
+        defaults={"source_url": fields["profile_url"] or _source_url(source, record_id), "raw_response": raw},
     )
     return lead
 
@@ -464,12 +467,33 @@ def _float_or_none(value):
 
 def _active_source_cooldown(source):
     state = SourceRateLimit.objects.filter(source_name=source).first()
-    return state if state and state.cooldown_until > timezone.now() else None
+    now = timezone.now()
+    if state and state.cooldown_until > now:
+        return state
+    if settings.MCP_DISTRIBUTED_SOURCE_LIMITS:
+        client = Redis.from_url(settings.CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            ttl = client.ttl(f"info-extractor:mcp-cooldown:{source}")
+            if ttl and ttl > 0:
+                return type("SharedCooldown", (), {"cooldown_until": now + timedelta(seconds=ttl)})()
+        except Exception:
+            logger.warning("Could not read shared MCP cooldown for %s; using database state", source)
+        finally:
+            client.close()
+    return None
 
 
 def _remember_source_rate_limit(source, error):
     now = timezone.now()
-    seconds = max(1, min(3600, error.retry_after_seconds or settings.SOURCE_RATE_LIMIT_COOLDOWN_SECONDS))
+    if error.retry_after_seconds:
+        fallback_seconds = error.retry_after_seconds
+    elif error.error_type == "monthly_quota_exceeded":
+        fallback_seconds = settings.SOURCE_MONTHLY_QUOTA_COOLDOWN_SECONDS
+    elif error.error_type == "daily_quota_exceeded":
+        fallback_seconds = settings.SOURCE_DAILY_QUOTA_COOLDOWN_SECONDS
+    else:
+        fallback_seconds = settings.SOURCE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+    seconds = max(1, fallback_seconds)
     cooldown_until = now + timedelta(seconds=seconds)
     state, _ = SourceRateLimit.objects.get_or_create(
         source_name=source,
@@ -477,9 +501,17 @@ def _remember_source_rate_limit(source, error):
     )
     if state.cooldown_until < cooldown_until:
         state.cooldown_until = cooldown_until
-    state.reason = "HTTP 429 rate limit"
+    state.reason = str(error)[:160] or "HTTP 429 rate limit"
     state.updated_at = now
     state.save(update_fields=["cooldown_until", "reason", "updated_at"])
+    if settings.MCP_DISTRIBUTED_SOURCE_LIMITS:
+        client = Redis.from_url(settings.CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            client.set(f"info-extractor:mcp-cooldown:{source}", "1", ex=max(1, int((state.cooldown_until - now).total_seconds())))
+        except Exception:
+            logger.warning("Could not publish shared MCP cooldown for %s; database state remains persisted", source)
+        finally:
+            client.close()
     return state.cooldown_until
 
 
@@ -496,13 +528,16 @@ def get_source_query_variants(trade_name, source):
         variants.extend(f"محصولات {item}" for item in variants[:2])
     elif source == "rasmio" and not company:
         variants.extend(f"شرکت {item}" for item in variants[:2])
+    elif source in {"iran_jobs", "quera"} and not company:
+        variants.extend(f"شرکت {item}" for item in variants[:2])
     return list(dict.fromkeys(item.strip() for item in variants if item.strip()))[:5]
 
 
 async def _search_catalog_source(source, job, execution, adapter, client, invoke, source_budget, variants):
     city = job.geographic_scope_name if job.geographic_scope_type == SearchJob.ScopeType.CITY else ""
     province = job.geographic_scope_name if job.geographic_scope_type == SearchJob.ScopeType.PROVINCE else ""
-    saved, errors = 0, []
+    saved, errors, was_rate_limited = 0, [], False
+    processed_ids = set()
     for variant in variants:
         if variant not in execution.query_variants:
             execution.query_variants = [*execution.query_variants, variant]
@@ -520,11 +555,24 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
         except MCPSourceError as exc:
             candidates = getattr(exc, "partial_records", [])
             execution.truncated = execution.truncated or getattr(exc, "truncated", False)
-            errors.append(str(exc))
+            if exc.rate_limited:
+                was_rate_limited = True
+                cooldown_until = await sync_to_async(_remember_source_rate_limit, thread_sensitive=True)(source, exc)
+                execution.error_type = exc.error_type if exc.error_type.endswith("quota_exceeded") else "long_cooldown" if exc.retry_after_seconds and exc.retry_after_seconds >= settings.SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS else "rate_limit"
+                execution.cooldown_until = cooldown_until
+                execution.retry_count += getattr(exc, "retry_count", 0)
+                execution.error_details = str(exc)[:2000]
+            else:
+                errors.append(str(exc))
         for record, detail in candidates:
             if saved >= source_budget:
                 break
             record = dict(record)
+            stable_id = str(record.get("_source_id") or _first(record, "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id") or "")
+            if stable_id and stable_id in processed_ids:
+                continue
+            if stable_id:
+                processed_ids.add(stable_id)
             actual_city = str(record.get("_source_city") or "").strip()
             actual_province = str(record.get("_source_province") or "").strip()
             if source == "basalam" and city and normalize_text(actual_city) != normalize_text(city):
@@ -549,6 +597,9 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
         execution.status = SourceExecution.Status.PARTIAL if execution.result_count else SourceExecution.Status.FAILED
         execution.error_count += len(errors)
         execution.error_details = "\n".join(errors)[-2000:]
+        execution.error_type = "source_error"
+    elif was_rate_limited:
+        execution.status = SourceExecution.Status.LONG_COOLDOWN if execution.error_type == "long_cooldown" else SourceExecution.Status.RATE_LIMITED
     else:
         execution.status = SourceExecution.Status.COMPLETED
     execution.completed_at = timezone.now()
@@ -585,8 +636,10 @@ async def _search_source(source, job, execution):
 
     cooldown = await sync_to_async(_active_source_cooldown, thread_sensitive=True)(source)
     if cooldown:
-        execution.status = SourceExecution.Status.SKIPPED
-        execution.error_count = max(1, execution.error_count)
+        remaining_cooldown = int((cooldown.cooldown_until - timezone.now()).total_seconds())
+        execution.status = SourceExecution.Status.LONG_COOLDOWN if remaining_cooldown >= settings.SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS else SourceExecution.Status.RATE_LIMITED
+        execution.error_type = "long_cooldown" if execution.status == SourceExecution.Status.LONG_COOLDOWN else "rate_limit"
+        execution.cooldown_until = cooldown.cooldown_until
         execution.error_details = f"منبع تا {timezone.localtime(cooldown.cooldown_until).strftime('%H:%M:%S')} به‌دلیل محدودیت نرخ موقتاً متوقف است؛ نتیجهٔ خالی محسوب نمی‌شود."
         execution.completed_at = timezone.now()
         await sync_to_async(execution.save, thread_sensitive=True)()
@@ -615,18 +668,30 @@ async def _search_source(source, job, execution):
             job_calls,
             other_pending_sources,
         )
-        if job_calls >= settings.MAX_MCP_CALLS_PER_JOB or client.request_count >= source_call_allowance:
+        if job_calls >= settings.MAX_MCP_CALLS_PER_JOB:
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
-            raise MCPSourceError(
-                f"{source} reached its fair share of the job call budget; remaining calls are reserved for other selected sources."
-            )
+            raise MCPBudgetExhausted("Global MCP call budget exhausted.", global_budget=True)
+        if source_call_allowance <= 0:
+            execution.truncated = True
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
+            raise MCPBudgetExhausted(f"{source} reached its fair share; remaining calls are reserved for other selected sources.")
         if client.request_count >= settings.SOURCE_MAX_CALLS_PER_JOB:
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
-            raise MCPSourceError(f"{source} به سقف تعداد فراخوانی این Job رسید؛ ادامهٔ منبع truncation محسوب می‌شود.")
+            raise MCPBudgetExhausted(f"{source} reached its per-source call budget.")
+        client.request_allowance = source_call_allowance
         try:
             result = await client.call(tool_name, arguments)
+        except MCPBudgetExhausted as exc:
+            execution.request_count = client.request_count
+            execution.truncated = True
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "truncated"])
+            await sync_to_async(SourceToolCall.objects.create, thread_sensitive=True)(
+                source_execution=execution, tool_name=tool_name, error_type=exc.error_type,
+                error_summary=str(exc)[:500],
+            )
+            raise
         except MCPSourceError as exc:
             if exc.rate_limited:
                 await sync_to_async(_remember_source_rate_limit, thread_sensitive=True)(source, exc)
@@ -634,8 +699,10 @@ async def _search_source(source, job, execution):
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
             await sync_to_async(SourceToolCall.objects.create, thread_sensitive=True)(
                 source_execution=execution, tool_name=tool_name, duration_ms=exc.duration_ms,
-                error_summary=str(exc)[:500]
+                error_summary=str(exc)[:500], error_type=exc.error_type, retry_count=exc.retry_count,
             )
+            execution.retry_count += exc.retry_count
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["retry_count"])
             raise
         execution.request_count = client.request_count
         await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
@@ -721,10 +788,14 @@ async def _search_source(source, job, execution):
                             if source == "neshan" and re.search(r"returned no details|no details for this place", str(exc), re.IGNORECASE):
                                 detail_warnings.append(f"{identifier}: جزئیات نشان موجود نبود؛ اطلاعات نتیجهٔ جست‌وجو استفاده شد.")
                                 await sync_to_async(_store_source_detail, thread_sensitive=True)(source, identifier, {}, cache_empty=True)
+                            elif exc.rate_limited:
+                                detail_rate_limited = True
+                                cooldown_until = await sync_to_async(_remember_source_rate_limit, thread_sensitive=True)(source, exc)
+                                execution.error_type = exc.error_type if exc.error_type.endswith("quota_exceeded") else "long_cooldown" if exc.retry_after_seconds and exc.retry_after_seconds >= settings.SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS else "rate_limit"
+                                execution.cooldown_until = cooldown_until
+                                detail_warnings.append(f"{identifier}: {exc}")
                             else:
                                 detail_errors.append(f"{identifier}: {exc}")
-                                if exc.rate_limited:
-                                    detail_rate_limited = True
                                 execution.error_count += 1
                             execution.error_details = "\n".join([*detail_errors, *detail_warnings])[-2000:]
                             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "error_count", "error_details"])
@@ -745,7 +816,10 @@ async def _search_source(source, job, execution):
                 break
             if detail_rate_limited:
                 break
-    execution.status = SourceExecution.Status.PARTIAL if detail_errors else SourceExecution.Status.COMPLETED
+    execution.status = SourceExecution.Status.PARTIAL if detail_errors else (
+        SourceExecution.Status.LONG_COOLDOWN if execution.error_type == "long_cooldown" else
+        SourceExecution.Status.RATE_LIMITED if detail_rate_limited else SourceExecution.Status.COMPLETED
+    )
     execution.completed_at = timezone.now()
     await sync_to_async(execution.save, thread_sensitive=True)()
     return saved
@@ -763,13 +837,28 @@ def execute_source(source, job, execution):
         execution.error_details = "جست‌وجو به درخواست کاربر لغو شد؛ نتایج جمع‌آوری‌شده حفظ شدند."
         execution.save(update_fields=["status", "completed_at", "error_details", "request_count"])
         return 0
+    except MCPBudgetExhausted as exc:
+        execution.status = SourceExecution.Status.BUDGET_EXHAUSTED
+        execution.error_type = exc.error_type
+        execution.truncated = True
+        execution.completed_at = timezone.now()
+        execution.error_details = str(exc)
+        execution.save(update_fields=["status", "error_type", "truncated", "completed_at", "error_details"])
+        return 0
     except Exception as exc:
         logger.exception("Search source %s failed for job %s", source, job.pk)
         if isinstance(exc, MCPSourceError) and exc.rate_limited:
-            _remember_source_rate_limit(source, exc)
-        execution.status = SourceExecution.Status.PARTIAL if execution.result_count else SourceExecution.Status.FAILED
+            cooldown_until = _remember_source_rate_limit(source, exc)
+            execution.cooldown_until = cooldown_until
+            execution.error_type = exc.error_type if exc.error_type.endswith("quota_exceeded") else "long_cooldown" if exc.retry_after_seconds and exc.retry_after_seconds >= settings.SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS else "rate_limit"
+            execution.retry_count += exc.retry_count
+            execution.status = SourceExecution.Status.LONG_COOLDOWN if execution.error_type == "long_cooldown" else SourceExecution.Status.RATE_LIMITED
+        else:
+            execution.error_type = getattr(exc, "error_type", "internal_error")
+            execution.status = SourceExecution.Status.PARTIAL if execution.result_count else SourceExecution.Status.FAILED
         execution.completed_at = timezone.now()
-        execution.error_count = max(1, execution.error_count)
+        if execution.status in {SourceExecution.Status.PARTIAL, SourceExecution.Status.FAILED}:
+            execution.error_count = max(1, execution.error_count)
         execution.error_details = str(exc)[:2000] if isinstance(exc, MCPSourceError) else f"Unexpected {type(exc).__name__}; see server logs."
-        execution.save(update_fields=["status", "completed_at", "error_count", "error_details", "request_count"])
+        execution.save(update_fields=["status", "completed_at", "error_count", "error_details", "request_count", "error_type", "retry_count", "cooldown_until"])
         return 0

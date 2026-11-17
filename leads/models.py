@@ -47,12 +47,15 @@ class SourceExecution(models.Model):
         CANCELLED = "cancelled", "لغوشده"
         PARTIAL = "partial", "نیمه‌کامل"
         SKIPPED = "skipped", "موقتاً متوقف"
+        RATE_LIMITED = "rate_limited", "محدودیت موقت منبع"
+        LONG_COOLDOWN = "long_cooldown", "وقفهٔ طولانی منبع"
+        BUDGET_EXHAUSTED = "budget_exhausted", "سهمیهٔ داخلی تمام شد"
         COMPLETED = "completed", "تکمیل‌شده"
         FAILED = "failed", "ناموفق"
 
     search_job = models.ForeignKey(SearchJob, on_delete=models.CASCADE, related_name="source_executions")
     source_name = models.CharField(max_length=40)
-    status = models.CharField(max_length=12, choices=Status.choices, default=Status.QUEUED)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.QUEUED)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     request_count = models.PositiveSmallIntegerField(default=0)
@@ -62,6 +65,10 @@ class SourceExecution(models.Model):
     areas_checked = models.JSONField(default=list, blank=True)
     truncated = models.BooleanField(default=False)
     error_details = models.TextField(blank=True)
+    error_type = models.CharField(max_length=40, blank=True)
+    retry_count = models.PositiveSmallIntegerField(default=0)
+    cooldown_until = models.DateTimeField(null=True, blank=True)
+    fallback_source = models.CharField(max_length=40, blank=True)
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["search_job", "source_name"], name="uniq_job_source")]
@@ -74,6 +81,8 @@ class SourceToolCall(models.Model):
     duration_ms = models.PositiveIntegerField(default=0)
     result_count = models.PositiveIntegerField(default=0)
     error_summary = models.CharField(max_length=500, blank=True)
+    error_type = models.CharField(max_length=40, blank=True)
+    retry_count = models.PositiveSmallIntegerField(default=0)
     called_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

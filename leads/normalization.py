@@ -13,7 +13,11 @@ def normalize_text(value):
     value = unicodedata.normalize("NFKC", value).translate(CHAR_TRANSLATION).translate(NUMBER_TRANSLATION)
     value = value.replace("\u200c", " ").replace("\u200f", "").replace("\u200e", "")
     value = re.sub(r"[\W_]+", " ", value, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", value).strip().casefold()
+    value = re.sub(r"\s+", " ", value).strip().casefold()
+    # Company suffixes are legal labels, not part of the trading identity.
+    value = re.sub(r"^(?:شرکت|موسسه|مؤسسه)\s+", "", value)
+    value = re.sub(r"\s+(?:سهامی خاص|سهامی عام|با مسئولیت محدود|مسئولیت محدود|تعاونی|غیرتجاری)$", "", value)
+    return value.strip()
 
 
 def normalize_phone(value):

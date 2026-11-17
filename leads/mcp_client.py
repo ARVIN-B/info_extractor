@@ -28,6 +28,7 @@ SOURCE_REGISTRY = {
         "fields": ["name", "category", "address", "phone", "website", "location"],
         "coverage": "شهرهای پشتیبانی‌شده در ابزار نشان؛ نتایج محدود به سقف ابزار",
         "access": "unofficial public read-only MCP",
+        "fallback_group": "local_business", "fallback_order": 2,
         "detail_min_interval_seconds": 6.0,
     },
     "balad": {
@@ -40,6 +41,7 @@ SOURCE_REGISTRY = {
         "fields": ["name", "category", "address", "phone", "website", "location"],
         "coverage": "شهرهای تحت پوشش ابزار بلد",
         "access": "unofficial public read-only MCP",
+        "fallback_group": "local_business", "fallback_order": 1,
         "detail_min_interval_seconds": float(settings.BALAD_DETAIL_MIN_INTERVAL_SECONDS),
     },
     "emalls": {
@@ -52,6 +54,7 @@ SOURCE_REGISTRY = {
         "fields": ["name", "website", "address", "phone", "public shop profile"],
         "coverage": "فروشگاه‌های فهرست‌شده در ایمالز؛ جست‌وجو با نام فروشگاه",
         "access": "unofficial public read-only MCP",
+        "fallback_group": "online_shop", "fallback_order": 1,
     },
     "basalam": {
         "package": "basalam-mcp==0.2.0",
@@ -63,6 +66,7 @@ SOURCE_REGISTRY = {
         "fields": ["name", "public vendor profile", "listing lead"],
         "coverage": "غرفه‌ها و فروشندگان حاضر در بازارگاه؛ تماس مستقل تضمین نمی‌شود",
         "access": "unofficial public read-only MCP",
+        "fallback_group": "marketplace_seller", "fallback_order": 1,
     },
     "rasmio": {
         "package": "rasmio-mcp==0.2.0",
@@ -75,13 +79,62 @@ SOURCE_REGISTRY = {
         "coverage": "شرکت‌های ثبت‌شده؛ جست‌وجو عمومی، بازکردن پروندهٔ مهمان بسیار محدود",
         "access": "unofficial public registry MCP; guest detail quota",
     },
+    "torob": {
+        "package": "torob-mcp==0.2.1", "executable": "torob-mcp", "tools": {"search": "tb_find_shops"},
+        "proxy_env": "TOROB_MCP_PROXY", "display_name": "ترب", "kind": "marketplace_seller",
+        "categories": ["online_shop", "retail", "all"], "fields": ["name", "shop_id", "public shop profile", "website when published"],
+        "coverage": "فروشگاه‌های فهرست‌شده در ترب؛ اطلاعات تماس مستقل تضمین نمی‌شود", "access": "unofficial public read-only MCP; MIT",
+        "fallback_group": "online_shop", "capabilities": ["shop_search", "seller_identity"], "enabled": True,
+    },
+    "iran_jobs": {
+        "package": "iran-jobs-mcp==0.2.0", "executable": "iran-jobs-mcp", "tools": {"search": "job_companies"},
+        "proxy_env": "IRAN_JOBS_MCP_PROXY", "display_name": "ایران جابز", "kind": "recruitment_company",
+        "categories": ["recruitment_company", "company", "all"], "fields": ["name", "company profile", "industry", "city", "website", "public jobs"],
+        "coverage": "شرکت‌های IranTalent، Jobinja و Jobvision؛ اطلاعات تماس فقط در صورت انتشار", "access": "unofficial public read-only MCP",
+        "fallback_group": "recruitment_company", "capabilities": ["company_search", "job_evidence"], "enabled": True,
+    },
+    "quera": {
+        "package": "quera-mcp==0.2.0", "executable": "quera-mcp", "tools": {"search": "qr_companies", "detail": "qr_company"},
+        "proxy_env": "QUERA_MCP_PROXY", "display_name": "کوئرا", "kind": "recruitment_company",
+        "categories": ["recruitment_company", "technology", "company", "all"], "fields": ["name", "public company profile", "industry", "city", "address", "website", "social links"],
+        "coverage": "شرکت‌های دارای پروفایل عمومی در کوئرا مگنت؛ تمرکز بر شرکت‌های فناوری", "access": "unofficial public read-only MCP; MIT",
+        "fallback_group": "recruitment_company", "fallback_order": 2, "capabilities": ["company_search", "company_profile", "public_business_links"], "enabled": True,
+    },
+    "digikala": {
+        "package": "digikala-mcp==0.6.1", "executable": "digikala-mcp", "tools": {"search": "dk_search", "detail": "dk_product"},
+        "proxy_env": "DIGIKALA_MCP_PROXY", "display_name": "دیجی‌کالا", "kind": "marketplace_seller",
+        "categories": ["online_shop", "retail", "all"], "fields": ["name", "seller_id", "public seller profile", "website when published"],
+        "coverage": "فروشندگان محصولات جست‌وجوشده؛ وب‌سایت یا تلفن مستقل تضمین نمی‌شود", "access": "unofficial public read-only MCP",
+        "fallback_group": "online_shop", "capabilities": ["product_search", "seller_offers"], "enabled": True,
+    },
+    "snappshop": {
+        "package": "snappshop-mcp==0.2.0", "executable": "snappshop-mcp", "tools": {"search": "ss_search", "detail": "ss_product"},
+        "proxy_env": "SNAPPSHOP_MCP_PROXY", "display_name": "اسنپ‌شاپ", "kind": "marketplace_seller",
+        "categories": ["online_shop", "retail", "all"], "fields": ["name", "seller_id", "public seller profile", "website when published"],
+        "coverage": "فروشندگان محصولات جست‌وجوشده؛ ممکن است به دسترسی شبکه‌ای ایران نیاز باشد", "access": "unofficial public read-only MCP",
+        "fallback_group": "online_shop", "capabilities": ["product_search", "seller_offers"], "enabled": True,
+    },
 }
+
+# Keep a complete, stable public metadata contract for forms, reports and adapters.
+for _source_id, _metadata in SOURCE_REGISTRY.items():
+    _metadata.setdefault("executable", _metadata.get("package", "").split("==", 1)[0])
+    _metadata.setdefault("source_type", _metadata.get("kind", "business_directory"))
+    _metadata.setdefault("capabilities", ["business_search"])
+    _metadata.setdefault("supported_fields", _metadata.get("fields", []))
+    _metadata.setdefault("rate_limit_policy", "honor retry-after; persistent shared cooldown; no long inline wait")
+    _metadata.setdefault("retry_policy", "one bounded retry for transient errors; short rate-limit retry only when configured")
+    _metadata.setdefault("timeout_policy", "SOURCE_TIMEOUT_SECONDS")
+    _metadata.setdefault("fallback_group", "")
+    _metadata.setdefault("fallback_order", 99)
+    _metadata["enabled"] = _source_id in settings.ENABLED_MCP_SOURCES
+    _metadata.setdefault("health_status", "not_checked")
 
 
 class MCPSourceError(Exception):
     """Safe, source-specific MCP error suitable for the job log."""
 
-    def __init__(self, message, duration_ms=0, retryable=False, rate_limited=False, retry_after_seconds=None):
+    def __init__(self, message, duration_ms=0, retryable=False, rate_limited=False, retry_after_seconds=None, error_type=None):
         safe_message = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", str(message))
         safe_message = re.sub(r"(?i)(api[_-]?key|token|authorization)(\s*[:=]\s*)[^\s,;]+", r"\1\2[redacted]", safe_message)
         super().__init__(safe_message)
@@ -89,36 +142,61 @@ class MCPSourceError(Exception):
         self.retryable = retryable
         detected, detected_after = _rate_limit_details(safe_message)
         self.rate_limited = rate_limited or detected
-        self.retry_after_seconds = retry_after_seconds or detected_after
+        self.retry_after_seconds = retry_after_seconds or _rate_limit_reset_seconds(safe_message) or detected_after
+        quota_type = "monthly_quota_exceeded" if "monthly" in safe_message.lower() else "daily_quota_exceeded" if "daily" in safe_message.lower() else "daily_quota_exceeded" if "quota exceeded" in safe_message.lower() else ""
+        self.error_type = error_type or (quota_type or ("rate_limit" if self.rate_limited else "source_timeout" if "timed out" in safe_message.lower() else "source_unavailable" if retryable else "tool_schema_error" if "tool" in safe_message.lower() or "schema" in safe_message.lower() else "internal_error"))
+        self.retry_count = 0
+
+
+class MCPBudgetExhausted(Exception):
+    """Expected internal budget boundary, not an upstream source error."""
+
+    def __init__(self, message, global_budget=False):
+        super().__init__(message)
+        self.error_type = "global_budget_exhausted" if global_budget else "fair_share_exhausted"
 
 
 def _rate_limit_details(message):
     text = str(message)
-    limited = bool(re.search(r"\b429\b|rate[ -]?limit|too many requests", text, re.IGNORECASE))
+    limited = bool(re.search(r"\b429\b|rate[ -]?limit|too many requests|daily quota|monthly quota|quota exceeded", text, re.IGNORECASE))
     if not limited:
         return False, None
-    retry_after = re.search(r"retry[- ]after\s*[:=]?\s*([^\s,;]+)", text, re.IGNORECASE)
+    retry_after = re.search(
+        r"retry[- ]after\s*[:=]?\s*(\d+|[A-Za-z]{3},\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+[\d:]+\s+GMT)",
+        text, re.IGNORECASE,
+    )
     if retry_after:
         raw = retry_after.group(1)
         if raw.isdigit():
-            return True, max(1, min(3600, int(raw)))
+            return True, max(1, int(raw))
         try:
             parsed = parsedate_to_datetime(raw)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=datetime_timezone.utc)
             seconds = int((parsed - datetime.now(datetime_timezone.utc)).total_seconds())
-            return True, max(1, min(3600, seconds))
+            return True, max(1, seconds)
         except (TypeError, ValueError, OverflowError):
             pass
-    wait = re.search(r"wait\s+(\d+)\s*(seconds?|minutes?|hours?)", text, re.IGNORECASE)
+    wait = re.search(r"wait\s+(\d+)\s*(seconds?|minutes?|hours?|days?)", text, re.IGNORECASE)
     if wait:
         amount = int(wait.group(1))
         unit = wait.group(2).lower()
-        seconds = amount * (3600 if unit.startswith("hour") else 60 if unit.startswith("minute") else 1)
-        return True, max(1, min(3600, seconds))
+        seconds = amount * (86400 if unit.startswith("day") else 3600 if unit.startswith("hour") else 60 if unit.startswith("minute") else 1)
+        return True, max(1, seconds)
     if re.search(r"wait\s+a\s+minute", text, re.IGNORECASE):
         return True, 60
+    if re.search(r"daily quota|monthly quota|quota exceeded", text, re.IGNORECASE):
+        return True, None
     return True, 60
+
+
+def _rate_limit_reset_seconds(message):
+    match = re.search(r"(?i)(?:x-ratelimit-reset|rate.?limit.?reset|reset(?:s|_at|_time)?|quota.?reset)\s*[:=]\s*(\d{10,13})", str(message))
+    if not match:
+        return None
+    value = int(match.group(1))
+    timestamp = value / 1000 if value > 10**12 else value
+    return max(1, int(timestamp - datetime.now(datetime_timezone.utc).timestamp()))
 
 
 @dataclass
@@ -211,6 +289,7 @@ class MCPToolClient:
         self.tools = tools
         self.request_count = 0
         self.distributed_limit = distributed_limit
+        self.request_allowance = None
 
     async def _call_with_source_limit(self, tool_name, arguments):
         config = SOURCE_REGISTRY[self.source_name]
@@ -265,8 +344,11 @@ class MCPToolClient:
             raise MCPSourceError(f"Invalid input schema for {tool_name}") from exc
         loop = asyncio.get_running_loop()
         started = loop.time()
-        attempts = 2
+        attempts_started_at = self.request_count
+        attempts = max(1, int(settings.SOURCE_RATE_LIMIT_MAX_RETRIES) + 1)
         for attempt in range(attempts):
+            if self.request_allowance is not None and self.request_count - attempts_started_at >= self.request_allowance:
+                raise MCPBudgetExhausted("No MCP calls remain in the reserved fair-share allowance.")
             self.request_count += 1
             try:
                 async with asyncio.timeout(settings.SOURCE_TIMEOUT_SECONDS):
@@ -275,9 +357,14 @@ class MCPToolClient:
                 return MCPCallResult(data, round((loop.time() - started) * 1000))
             except MCPSourceError as exc:
                 exc.duration_ms = round((loop.time() - started) * 1000)
-                if not exc.retryable or attempt + 1 == attempts:
+                exc.retry_count = attempt
+                inline_wait = exc.retry_after_seconds or 0
+                can_retry_rate_limit = exc.rate_limited and 0 < inline_wait <= settings.SOURCE_RATE_LIMIT_MAX_INLINE_WAIT_SECONDS
+                if not (exc.retryable or can_retry_rate_limit) or attempt + 1 == attempts:
                     raise
                 logger.warning("Retrying transient MCP error for %s.%s", self.source_name, tool_name)
+                if can_retry_rate_limit:
+                    await asyncio.sleep(inline_wait + random.uniform(0, settings.SOURCE_RATE_LIMIT_JITTER))
             except TimeoutError as exc:
                 if attempt + 1 == attempts:
                     duration = round((loop.time() - started) * 1000)

@@ -2,10 +2,12 @@ import logging
 from datetime import timedelta
 
 from celery import shared_task
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 from .models import BusinessLead, SearchJob, SourceExecution
+from .mcp_client import SOURCE_REGISTRY
 from .sources import execute_source
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,11 @@ def run_search_job(self, job_id):
         # the whole result budget before later, higher-value sources run.
         ordered_sources = list(dict.fromkeys(job.selected_sources))
         ordered_sources.extend(name for name in executions if name not in ordered_sources)
-        for source_name in ordered_sources:
+        cursor = 0
+        fallback_depth = {}
+        while cursor < len(ordered_sources):
+            source_name = ordered_sources[cursor]
+            cursor += 1
             if SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.CANCELLED).exists():
                 return {"status": SearchJob.Status.CANCELLED, "leads": job.leads.count()}
             execution = executions.get(source_name)
@@ -38,18 +44,55 @@ def run_search_job(self, job_id):
             if execution.status == SourceExecution.Status.COMPLETED:
                 continue
             execute_source(execution.source_name, job, execution)
-            execution.refresh_from_db(fields=["status"])
+            execution.refresh_from_db(fields=["status", "error_type"])
             if execution.status == SourceExecution.Status.COMPLETED:
                 success_count += 1
+            if settings.SOURCE_FALLBACK_ENABLED and execution.error_type in {"rate_limit", "long_cooldown"}:
+                group = SOURCE_REGISTRY.get(source_name, {}).get("fallback_group")
+                depth = fallback_depth.get(source_name, 0)
+                if group and depth < settings.SOURCE_FALLBACK_MAX_DEPTH:
+                    candidates = sorted(
+                        (name for name, config in SOURCE_REGISTRY.items()
+                         if name in settings.ENABLED_MCP_SOURCES
+                         and config.get("fallback_group") == group
+                         and name not in executions),
+                        key=lambda name: SOURCE_REGISTRY[name].get("fallback_order", 99),
+                    )
+                    if candidates:
+                        fallback_name = candidates[0]
+                        fallback_execution = SourceExecution.objects.create(
+                            search_job=job, source_name=fallback_name,
+                            fallback_source=source_name,
+                        )
+                        executions[fallback_name] = fallback_execution
+                        ordered_sources.insert(cursor, fallback_name)
+                        fallback_depth[fallback_name] = depth + 1
+                        execution.fallback_source = fallback_name
+                        execution.save(update_fields=["fallback_source"])
             job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
             job.total_unique_businesses = job.leads.count()
             job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
             job.save(update_fields=["total_raw_results", "total_unique_businesses", "total_errors"])
-        incomplete_sources = job.source_executions.exclude(status=SourceExecution.Status.COMPLETED)
-        errors = list(incomplete_sources.values_list("source_name", "error_details"))
+        real_failure_statuses = [SourceExecution.Status.PARTIAL, SourceExecution.Status.FAILED]
+        errors = list(job.source_executions.filter(status__in=real_failure_statuses).values_list("source_name", "error_details"))
+        limited_sources = job.source_executions.filter(status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count()
         job.error_summary = "\n".join(f"{source}: {message}" for source, message in errors)
+        if limited_sources and not errors:
+            job.error_summary = "برخی منابع محدودیت دسترسی موقت داشتند؛ نتایج منابع در دسترس جمع‌آوری شدند."
+        long_cooldown = job.source_executions.filter(
+            status=SourceExecution.Status.LONG_COOLDOWN, cooldown_until__gt=timezone.now()
+        ).order_by("cooldown_until").first()
+        if long_cooldown and not errors:
+            delay = max(1, int((long_cooldown.cooldown_until - timezone.now()).total_seconds()))
+            queued = SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.RUNNING).update(
+                status=SearchJob.Status.QUEUED, completed_at=None,
+            )
+            if queued:
+                continuation = run_search_job.apply_async(args=[job_id], countdown=delay)
+                SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.QUEUED).update(celery_task_id=continuation.id)
+                return {"status": SearchJob.Status.QUEUED, "leads": job.leads.count(), "resume_in_seconds": delay}
         has_results = job.leads.exists()
-        job.status = SearchJob.Status.FAILED if not success_count and not has_results else (SearchJob.Status.PARTIAL if errors else SearchJob.Status.COMPLETED)
+        job.status = SearchJob.Status.FAILED if errors and not success_count and not has_results else (SearchJob.Status.PARTIAL if errors else SearchJob.Status.COMPLETED)
         job.total_unique_businesses = job.leads.count()
         job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
         job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))

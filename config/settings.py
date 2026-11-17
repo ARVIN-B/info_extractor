@@ -160,6 +160,15 @@ MAX_MCP_CALLS_PER_JOB = int(os.environ.get("MAX_MCP_CALLS_PER_JOB", "200"))
 SOURCE_RATE_LIMIT_COOLDOWN_SECONDS = int(
     os.environ.get("SOURCE_RATE_LIMIT_COOLDOWN_SECONDS", "60")
 )
+SOURCE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS", SOURCE_RATE_LIMIT_COOLDOWN_SECONDS))
+SOURCE_RATE_LIMIT_MAX_INLINE_WAIT_SECONDS = int(os.environ.get("SOURCE_RATE_LIMIT_MAX_INLINE_WAIT_SECONDS", "5"))
+SOURCE_RATE_LIMIT_MAX_RETRIES = int(os.environ.get("SOURCE_RATE_LIMIT_MAX_RETRIES", "1"))
+SOURCE_RATE_LIMIT_JITTER = float(os.environ.get("SOURCE_RATE_LIMIT_JITTER", "1"))
+SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS = int(os.environ.get("SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS", "3600"))
+SOURCE_DAILY_QUOTA_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_DAILY_QUOTA_COOLDOWN_SECONDS", "86400"))
+SOURCE_MONTHLY_QUOTA_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_MONTHLY_QUOTA_COOLDOWN_SECONDS", "2592000"))
+SOURCE_FALLBACK_ENABLED = env_bool("SOURCE_FALLBACK_ENABLED", True)
+SOURCE_FALLBACK_MAX_DEPTH = int(os.environ.get("SOURCE_FALLBACK_MAX_DEPTH", "4"))
 BALAD_DETAIL_MIN_INTERVAL_SECONDS = float(
     os.environ.get("BALAD_DETAIL_MIN_INTERVAL_SECONDS", "6")
 )
@@ -169,8 +178,8 @@ SOURCE_DETAIL_CACHE_TTL_SECONDS = int(
 MCP_DISTRIBUTED_SOURCE_LIMITS = env_bool("MCP_DISTRIBUTED_SOURCE_LIMITS", not DEBUG)
 ENABLED_MCP_SOURCES = [
     name.strip().lower()
-    for name in os.environ.get("ENABLED_MCP_SOURCES", "neshan,balad").split(",")
-    if name.strip().lower() in {"neshan", "balad", "emalls", "basalam", "rasmio"}
+    for name in os.environ.get("ENABLED_MCP_SOURCES", "neshan,balad,emalls,basalam,rasmio,torob,iran_jobs,quera,digikala,snappshop").split(",")
+    if name.strip().lower() in {"neshan", "balad", "emalls", "basalam", "rasmio", "torob", "iran_jobs", "quera", "digikala", "snappshop"}
 ]
 # MCP_BIN_DIR = BASE_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin")
 # MCP_SERVER_PATHS = {
@@ -219,5 +228,10 @@ MCP_SERVER_PATHS = {
         "emalls": "emalls-ir-mcp",
         "basalam": "basalam-mcp",
         "rasmio": "rasmio-mcp",
+        "torob": "torob-mcp",
+        "iran_jobs": "iran-jobs-mcp",
+        "quera": "quera-mcp",
+        "digikala": "digikala-mcp",
+        "snappshop": "snappshop-mcp",
     }.items()
 }

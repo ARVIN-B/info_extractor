@@ -6,6 +6,11 @@ attrs==26.1.0
 balad-mcp==0.2.0
 basalam-mcp==0.2.0
 emalls-ir-mcp==0.2.0
+torob-mcp
+iran-jobs-mcp
+quera-mcp
+digikala-mcp
+snappshop-mcp
 billiard==4.3.2
 celery==5.7.0
 certifi==2026.10.23
