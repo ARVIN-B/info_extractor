@@ -12,10 +12,10 @@
       <div class="field"><label for="{{ form.max_results.id_for_label }}">{{ form.max_results.label }}</label>{{ form.max_results }}{{ form.max_results.errors }}<small>از ۱ تا {{ form.max_results.field.max_value }} سرنخ در هر جست‌وجو؛ میزان واقعی به پوشش و محدودیت منبع‌ها بستگی دارد.</small></div>
       <button class="button primary" type="submit">شروع جست‌وجو <span>←</span></button>
     </form>
-    <div class="privacy-note"><span>ⓘ</span><p>شمارهٔ تلفن فقط از نظر قالب بررسی می‌شود؛ این بررسی فعال‌بودن یا مالکیت شماره را ثابت نمی‌کند.</p></div>
+    <div class="privacy-note"><span>ⓘ</span><p>نتیجهٔ موفق فقط با شمارهٔ موبایل ایران (`09…`، `+989…`، `9…` یا `989…`) نمایش داده می‌شود. شماره صرفاً از نظر قالب بررسی می‌شود و فعال‌بودن یا مالکیت آن تأیید نمی‌شود.</p></div>
   </section>
   <aside class="card recent-card"><div class="section-heading"><div><p class="eyebrow">تاریخچه</p><h2>جست‌وجوهای اخیر</h2></div></div>
-    {% if jobs %}<div class="job-list">{% for job in jobs %}<a class="job-row" href="{% url 'job_detail' job.pk %}"><div class="job-row-top"><strong>{{ job.trade_name }}</strong><span class="status-pill {{ job.status }}">{{ job.get_status_display }}</span></div><span class="muted">{{ job.geographic_scope_name }} · {{ job.created_at|date:'Y/m/d H:i' }}</span><span class="job-count">{{ job.total_unique_businesses }} نتیجه</span></a>{% endfor %}</div>
+    {% if jobs %}<div class="job-list">{% for job in jobs %}<a class="job-row" href="{% url 'job_detail' job.pk %}"><div class="job-row-top"><strong>{{ job.trade_name }}</strong><span class="status-pill {{ job.status }}">{{ job.get_status_display }}</span></div><span class="muted">{{ job.geographic_scope_name }} · {{ job.created_at|date:'Y/m/d H:i' }}</span><span class="job-count">{{ job.total_unique_businesses }} نتیجهٔ موفق با موبایل</span></a>{% endfor %}</div>
     {% else %}<div class="empty-state"><span>⌕</span><p>هنوز جست‌وجویی ثبت نشده است.</p></div>{% endif %}
   </aside>
 </div>

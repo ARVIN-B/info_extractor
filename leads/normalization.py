@@ -38,6 +38,16 @@ def phone_is_valid(value):
     return bool(normalize_phone(value))
 
 
+def has_iranian_mobile(phones):
+    """Return whether any phone is an Iranian mobile after canonicalization."""
+    for phone in phones or []:
+        raw = str(phone or "").translate(NUMBER_TRANSLATION).strip()
+        compact = "".join(char for char in raw if char.isdigit() or char == "+")
+        if compact.startswith(("09", "+989", "9", "989")) and normalize_phone(phone).startswith("09"):
+            return True
+    return False
+
+
 def normalize_website(value):
     raw = str(value or "").strip()
     if not raw:

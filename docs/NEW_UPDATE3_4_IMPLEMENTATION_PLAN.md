@@ -50,3 +50,12 @@
 - The dedup regression test seeds 301 leads and asserts matching uses two lead queries, with the second narrowed by normalized name. This verifies query shape, not end-to-end latency under production load. Providers without stable cursors/totals may still truncate or repeat records; monitor task duration and provider budgets in production.
 - Provider quota figures remain account-specific or unpublished; see the links and caveats in README.
 - Deployment: `python manage.py migrate`, then restart web, Celery workers and Celery Beat. Windows local equivalent: `\.venv\Scripts\python.exe manage.py migrate`.
+
+## Mobile-only success update
+
+- [x] Canonicalize Iranian mobile numbers and accept valid `09…`, `+989…`, `9…`, and `989…` prefixes as business success.
+- [x] Persist an indexed mobile-success flag and backfill existing lead rows with migration `0011_businesslead_mobile_success`.
+- [x] Count successful leads toward job targets only after a mobile is found; allow later source enrichment to promote a previously incomplete lead once.
+- [x] Restrict results, detail views and JSON/Excel exports to mobile-qualified businesses while retaining other records internally for enrichment and diagnostics.
+- [x] Cover Persian/E.164 number formats, promotion by later sources, and exclusion from successful UI and exports.
+- [x] Run 72 tests, Django checks, migration drift and isolated legacy-data migration validation; no package installation or application-database migration was performed.

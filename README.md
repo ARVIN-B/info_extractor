@@ -9,6 +9,7 @@
 - کلاینت رسمی MCP Python SDK روی STDIO؛ ابزارها و schemaها از MCP واقعی خوانده و آرگومان‌ها پیش از فراخوانی بررسی می‌شوند.
 - connectorهای نشان، بلد، ایمالز، باسلام و رسمیو حفظ شده‌اند؛ چهار connector ترب، ایران‌جابز، دیجی‌کالا و اسنپ‌شاپ با نسخهٔ pin شده و Adapter مستقل اضافه شده‌اند.
 - نرمال‌سازی حروف و رقم فارسی، قالب تلفن و دامنه؛ ادغام محافظه‌کارانه بر اساس شناسهٔ مشترک یا تلفن/دامنه همراه با نام و نشانی یکسان.
+- نتیجهٔ موفق کسب‌وکار فقط وقتی ثبت و نمایش داده می‌شود که حداقل یک موبایل ایران با پیشوند خام `09`، `+989`، `9` یا `989` و طول معتبر داشته باشد؛ شماره‌های ثابت در دادهٔ داخلی می‌مانند اما در نتایج، صفحهٔ جزئیات و خروجی‌های JSON/Excel موفق ارائه نمی‌شوند.
 - ورود Django و کنترل دسترسی بر اساس مالک job؛ خروجی‌ها نیازمند ورود هستند.
 - تست‌های خودکار از دادهٔ mock استفاده می‌کنند و به وب‌سایت‌های زنده وصل نمی‌شوند.
 
@@ -218,7 +219,7 @@ Gunicorn، Celery worker و Celery beat را به‌صورت سرویس‌های
 
 برای deploy روی چابکان، نمونهٔ Supervisor در [`supervisor.conf`](supervisor.conf) دو process worker و beat را با Python سیستمی `/usr/local/bin/python` اجرا می‌کند. migrationها هنگام deploy باید جداگانه با `cd /app && /usr/local/bin/python manage.py migrate --noinput` اعمال شوند؛ چابکان از روی این log آن‌ها را خودکار اجرا نکرده است. دستور بررسی و مراحل Redis/log در [`docs/CHABOKAN_CELERY.md`](docs/CHABOKAN_CELERY.md) آمده است. پروژه نام واقعی `config` را حفظ می‌کند و یک ورودی سازگاری `app` برای دستور راهنمای چابکان فراهم می‌کند.
 
-در deploy این تغییر، کد و migrationهای `0008_query_expansion_cache`, `0009_source_checkpoints`, و `0010_index_national_id` را منتشر کن؛ سپس یک بار `python manage.py migrate --noinput` را با همان Python اجرایی برنامه اجرا و web، تمام Celery workerها و Beat را restart کن. اجرای `python manage.py check` و `python manage.py check_mcp --source all --schema-only` را پیش از پذیرش jobهای جدید انجام بده. برای اجرای محلی Windows از `\.venv\Scripts\python.exe manage.py migrate` و `\.venv\Scripts\python.exe manage.py check` استفاده کن.
+در deploy این تغییر، کد و migrationهای `0008_query_expansion_cache`, `0009_source_checkpoints`, `0010_index_national_id`, و `0011_businesslead_mobile_success` را منتشر کن؛ سپس یک بار `python manage.py migrate --noinput` را با همان Python اجرایی برنامه اجرا و web، تمام Celery workerها و Beat را restart کن. اجرای `python manage.py check` و `python manage.py check_mcp --source all --schema-only` را پیش از پذیرش jobهای جدید انجام بده. برای اجرای محلی Windows از `\.venv\Scripts\python.exe manage.py migrate` و `\.venv\Scripts\python.exe manage.py check` استفاده کن.
 
 Health check عمومی `GET /health/` متن `ok` می‌دهد و شامل اطلاعاتی از سیستم نیست. خطاهای فنی در log سرور نگه‌داری می‌شوند؛ متن exception نامنتظره به کاربر نمایش داده نمی‌شود.
 

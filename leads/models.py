@@ -2,6 +2,8 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+from .normalization import has_iranian_mobile
+
 
 class SearchJob(models.Model):
     class ScopeType(models.TextChoices):
@@ -149,6 +151,7 @@ class BusinessLead(models.Model):
     normalized_name = models.CharField(max_length=255, db_index=True)
     original_name = models.CharField(max_length=255)
     phone_numbers = models.JSONField(default=list, blank=True)
+    has_mobile_phone = models.BooleanField(default=False, db_index=True)
     emails = models.JSONField(default=list, blank=True)
     social_urls = models.JSONField(default=list, blank=True)
     address = models.TextField(blank=True)
@@ -171,6 +174,13 @@ class BusinessLead(models.Model):
     class Meta:
         ordering = ["normalized_name", "city"]
         indexes = [models.Index(fields=["search_job", "city"]), models.Index(fields=["search_job", "verification_status"])]
+
+    def save(self, *args, **kwargs):
+        self.has_mobile_phone = has_iranian_mobile(self.phone_numbers)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            kwargs["update_fields"] = set(update_fields) | {"has_mobile_phone"}
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.original_name

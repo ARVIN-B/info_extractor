@@ -14,6 +14,10 @@ from .query_expansion import expand_query
 logger = logging.getLogger(__name__)
 
 
+def _successful_lead_count(job):
+    return job.leads.filter(has_mobile_phone=True).count()
+
+
 @shared_task(bind=True, name="leads.run_search_job", acks_late=True, reject_on_worker_lost=True, time_limit=900, soft_time_limit=840)
 def run_search_job(self, job_id):
     started_at = timezone.now()
@@ -48,7 +52,7 @@ def run_search_job(self, job_id):
             source_name = ordered_sources[cursor]
             cursor += 1
             if SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.CANCELLED).exists():
-                return {"status": SearchJob.Status.CANCELLED, "leads": job.leads.count()}
+                return {"status": SearchJob.Status.CANCELLED, "leads": _successful_lead_count(job)}
             execution = executions.get(source_name)
             if execution is None:
                 continue
@@ -85,7 +89,7 @@ def run_search_job(self, job_id):
                         execution.fallback_source = fallback_name
                         execution.save(update_fields=["fallback_source"])
             job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
-            job.total_unique_businesses = job.leads.count()
+            job.total_unique_businesses = _successful_lead_count(job)
             job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
             job.save(update_fields=["total_raw_results", "total_unique_businesses", "total_errors"])
         pending = job.source_executions.filter(status=SourceExecution.Status.QUEUED).exists()
@@ -96,7 +100,7 @@ def run_search_job(self, job_id):
             if queued:
                 continuation = run_search_job.apply_async(args=[job_id], countdown=0)
                 SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.QUEUED).update(celery_task_id=continuation.id)
-                return {"status": SearchJob.Status.QUEUED, "leads": job.leads.count(), "continuing": True}
+                return {"status": SearchJob.Status.QUEUED, "leads": _successful_lead_count(job), "continuing": True}
         real_failure_statuses = [SourceExecution.Status.PARTIAL, SourceExecution.Status.FAILED]
         errors = list(job.source_executions.filter(status__in=real_failure_statuses).values_list("source_name", "error_details"))
         limited_sources = job.source_executions.filter(status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count()
@@ -115,12 +119,12 @@ def run_search_job(self, job_id):
             if queued:
                 continuation = run_search_job.apply_async(args=[job_id], countdown=delay)
                 SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.QUEUED).update(celery_task_id=continuation.id)
-                return {"status": SearchJob.Status.QUEUED, "leads": job.leads.count(), "resume_in_seconds": delay}
-        has_results = job.leads.exists()
+                return {"status": SearchJob.Status.QUEUED, "leads": _successful_lead_count(job), "resume_in_seconds": delay}
+        has_results = job.leads.filter(has_mobile_phone=True).exists()
         budget_stops = job.source_executions.filter(status=SourceExecution.Status.BUDGET_EXHAUSTED).count()
         budget_message = "\nسقف داخلی درخواست منبع به پایان رسید؛ برای ادامه باید سقف مجاز را افزایش دهید." if budget_stops else ""
         job.status = SearchJob.Status.FAILED if errors and not success_count and not has_results else (SearchJob.Status.PARTIAL if errors or budget_stops else SearchJob.Status.COMPLETED)
-        job.total_unique_businesses = job.leads.count()
+        job.total_unique_businesses = _successful_lead_count(job)
         job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
         job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
         job.completed_at = timezone.now()
@@ -134,17 +138,17 @@ def run_search_job(self, job_id):
         )
         if not updated:
             job.refresh_from_db(fields=["status"])
-            return {"status": job.status, "leads": job.leads.count()}
+            return {"status": job.status, "leads": _successful_lead_count(job)}
         return {"status": job.status, "leads": job.total_unique_businesses, "errors": job.total_errors}
     except Exception:
         logger.exception("Search job %s failed", job_id)
         job.refresh_from_db()
         if job.status == SearchJob.Status.CANCELLED:
-            return {"status": job.status, "leads": job.leads.count()}
+            return {"status": job.status, "leads": _successful_lead_count(job)}
         job.status = SearchJob.Status.FAILED
         job.completed_at = timezone.now()
         job.error_summary = "جست‌وجو به‌دلیل خطای داخلی متوقف شد. جزئیات فنی در گزارش سرور ثبت شده است."
-        job.total_unique_businesses = job.leads.count()
+        job.total_unique_businesses = _successful_lead_count(job)
         job.save(update_fields=["status", "completed_at", "error_summary", "total_unique_businesses"])
         raise
 

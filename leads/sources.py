@@ -17,7 +17,7 @@ from redis import Redis
 from .adapters import SOURCE_ADAPTERS
 from .mcp_client import MCPBudgetExhausted, MCPSourceError, SOURCE_REGISTRY, source_session
 from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
-from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
+from .normalization import has_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
 
 logger = logging.getLogger(__name__)
 
@@ -344,7 +344,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
     invalid_phone_values = [str(phone).strip() for phone in fields["phones"] if str(phone).strip() and not phone_is_valid(phone)]
     all_phone_values = list(dict.fromkeys(valid_phones))
     lead = _find_match(job, source, record_id, fields)
-    created = lead is None
+    was_mobile = bool(lead and (lead.has_mobile_phone or has_iranian_mobile(lead.phone_numbers)))
     source_ids = dict(lead.source_record_ids) if lead else {}
     source_ids[source] = record_id
     sources = list(dict.fromkeys((lead.source_names if lead else []) + [source]))
@@ -352,6 +352,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
     source_city = fields["city"] or str(search_record.get("_searched_city") or "")
     source_province = fields["province"] or CITY_PROVINCE.get(source_city, job.geographic_scope_name if job.geographic_scope_type == SearchJob.ScopeType.PROVINCE else "")
     phones = list(dict.fromkeys((lead.phone_numbers if lead else []) + all_phone_values))
+    has_mobile_phone = has_iranian_mobile(phones)
     emails = list(dict.fromkeys((lead.emails if lead else []) + [email.lower() for email in fields["emails"]]))
     socials = list(dict.fromkeys((lead.social_urls if lead else []) + [normalize_website(url)[0] for url in fields["social_urls"] if normalize_website(url)[0]]))
     if invalid_phone_values and not valid_phones:
@@ -379,6 +380,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
     if lead:
         lead.normalized_name = lead.normalized_name or normalize_text(fields["name"])
         lead.phone_numbers = phones
+        lead.has_mobile_phone = has_mobile_phone
         lead.emails = emails
         lead.social_urls = socials
         lead.address = address
@@ -400,6 +402,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
         lead = BusinessLead.objects.create(
             search_job=job, normalized_name=normalize_text(fields["name"]), original_name=fields["name"],
             phone_numbers=phones, address=address, city=source_city,
+            has_mobile_phone=has_mobile_phone,
             province=source_province,
             website=website, business_category=fields["category"], latitude=_float_or_none(fields["lat"]),
             longitude=_float_or_none(fields["lng"]), source_names=sources, source_record_ids=source_ids,
@@ -444,7 +447,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
         field_name="raw_response", field_value="Original search and detail response",
         defaults={"source_url": fields["profile_url"] or _source_url(source, record_id), "raw_response": raw},
     )
-    return (lead, created) if return_created else lead
+    return (lead, has_mobile_phone and not was_mobile) if return_created else lead
 
 
 def _normalized_evidence_value(field_name, value):
@@ -629,8 +632,8 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
             record["_searched_city"] = actual_city or city or province
             if record.get("_source_id"):
                 record.setdefault("id", record["_source_id"])
-            lead, created = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail, return_created=True)
-            if lead and created:
+            lead, newly_qualified = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail, return_created=True)
+            if lead and newly_qualified:
                 saved += 1
         execution.result_count += len(candidates)
         await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["result_count"])
@@ -700,7 +703,9 @@ async def _search_source(source, job, execution):
     
     variants = get_source_query_variants(job.trade_name, source, getattr(job, "query_expansion", {}))
     scope_points = get_scope_points(job)
-    remaining = max(0, job.max_results - await sync_to_async(job.leads.count, thread_sensitive=True)())
+    remaining = max(0, job.max_results - await sync_to_async(
+        lambda: job.leads.filter(has_mobile_phone=True).count(), thread_sensitive=True
+    )())
     if remaining == 0:
         execution.status = SourceExecution.Status.COMPLETED
         execution.completed_at = timezone.now()
@@ -904,8 +909,8 @@ async def _search_source(source, job, execution):
                     execution.request_count = initial_request_count + client.request_count
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
                     record["_searched_city"] = place_name
-                    lead, created = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail_data, return_created=True)
-                    if lead and created:
+                    lead, newly_qualified = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail_data, return_created=True)
+                    if lead and newly_qualified:
                         saved += 1
                         location_saved += 1
                 if resume_offset is not None:

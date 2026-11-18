@@ -76,7 +76,8 @@ def job_detail(request, job_id):
         status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN],
         cooldown_until__gt=timezone.now(),
     ).order_by("cooldown_until").values_list("cooldown_until", flat=True).first()
-    leads = job.leads.all()
+    # Only mobile-qualified businesses are presented as successful results.
+    leads = job.leads.filter(has_mobile_phone=True)
     source = request.GET.get("source", "")
     city = request.GET.get("city", "").strip()[:120]
     verification = request.GET.get("verification", "")
@@ -90,7 +91,7 @@ def job_detail(request, job_id):
     if verification in BusinessLead.Verification.values:
         leads = leads.filter(verification_status=verification)
     if has_phone:
-        leads = leads.exclude(phone_numbers=[])
+        leads = leads.filter(has_mobile_phone=True)
     if has_website:
         leads = leads.exclude(website="")
     page = Paginator(leads.prefetch_related("evidence"), 25).get_page(request.GET.get("page"))
@@ -104,10 +105,10 @@ def job_detail(request, job_id):
         "source_catalog": SOURCE_REGISTRY,
         "available_sources": available_sources,
         "summary": {
-            "with_phone": job.leads.exclude(phone_numbers=[]).count(),
-            "without_phone": job.leads.filter(phone_numbers=[]).count(),
-            "with_email": job.leads.exclude(emails=[]).count(),
-            "with_website": job.leads.exclude(website="").count(),
+            "with_phone": job.leads.filter(has_mobile_phone=True).count(),
+            "without_phone": job.leads.filter(has_mobile_phone=False).count(),
+            "with_email": job.leads.filter(has_mobile_phone=True).exclude(emails=[]).count(),
+            "with_website": job.leads.filter(has_mobile_phone=True).exclude(website="").count(),
             "partial_sources": job.source_executions.filter(status__in=[SourceExecution.Status.PARTIAL, SourceExecution.Status.SKIPPED, SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count(),
             "successful_sources": job.source_executions.filter(status=SourceExecution.Status.COMPLETED).count(),
             "limited_sources": job.source_executions.filter(status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count(),
@@ -158,7 +159,7 @@ def cancel_job(request, job_id):
 @login_required
 def lead_detail(request, job_id, lead_id):
     job = owned_job(request.user, job_id)
-    lead = get_object_or_404(BusinessLead, pk=lead_id, search_job=job)
+    lead = get_object_or_404(BusinessLead, pk=lead_id, search_job=job, has_mobile_phone=True)
     return render(request, "leads/lead_detail.html", {"job": job, "lead": lead, "evidence": lead.evidence.all()})
 
 
@@ -169,7 +170,7 @@ def _json_safe_value(value):
 @login_required
 def export_json(request, job_id):
     job = owned_job(request.user, job_id)
-    leads = job.leads.prefetch_related("evidence").all()
+    leads = job.leads.filter(has_mobile_phone=True).prefetch_related("evidence")
     payload = {
         "job": {"id": job.pk, "trade_name": job.trade_name, "scope_type": job.geographic_scope_type,
                 "scope_name": job.geographic_scope_name, "status": job.status},
@@ -210,7 +211,7 @@ def export_excel(request, job_id):
     sheet.title = "سرنخ‌ها"
     headers = ["نام کسب‌وکار", "صنف/دسته", "شهر", "استان", "نشانی", "تلفن عمومی", "ایمیل عمومی", "وب‌سایت", "شبکهٔ اجتماعی", "شناسهٔ ملی", "نوع کسب‌وکار", "منبع", "امتیاز کیفیت", "وضعیت تلفن", "وضعیت بررسی"]
     sheet.append(headers)
-    for lead in job.leads.all():
+    for lead in job.leads.filter(has_mobile_phone=True):
         sheet.append([_excel_safe(value) for value in [
             lead.original_name, lead.business_category, lead.city, lead.province, lead.address,
             "، ".join(lead.phone_numbers), "، ".join(lead.emails), lead.website,
@@ -219,7 +220,7 @@ def export_excel(request, job_id):
         ]])
     evidence = workbook.create_sheet("شواهد")
     evidence.append(["نام کسب‌وکار", "منبع", "شناسهٔ منبع", "پیوند", "فیلد", "مقدار", "زمان گردآوری"])
-    for item in LeadEvidence.objects.filter(business_lead__search_job=job).select_related("business_lead"):
+    for item in LeadEvidence.objects.filter(business_lead__search_job=job, business_lead__has_mobile_phone=True).select_related("business_lead"):
         evidence.append([_excel_safe(value) for value in [
             item.business_lead.original_name, item.source_name, item.source_record_id, item.source_url,
             item.field_name, item.field_value, item.collected_at.isoformat(),

@@ -23,7 +23,7 @@ from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, QueraCompanyAdapt
 from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, SOURCE_REGISTRY, decode_result
 from .forms import SearchJobForm
 from .models import BusinessLead, LeadEvidence, QueryExpansionCache, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
-from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
+from .normalization import has_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
 from .query_expansion import category_for_query, expand_query
 from .sources import _cached_source_detail, _catalog_page_fingerprint, _find_match, _is_repeated_catalog_page, _store_source_detail, calculate_source_budget, calculate_source_call_allowance, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
 from .tasks import recover_stale_search_jobs, run_search_job
@@ -36,6 +36,12 @@ class NormalizationTests(TestCase):
     def test_iranian_phone_formats(self):
         self.assertEqual(normalize_phone("+98 912 345 6789"), "09123456789")
         self.assertEqual(normalize_phone("۰۹۱۲۳۴۵۶۷۸۹"), "09123456789")
+        self.assertTrue(has_iranian_mobile(["02112345678", "+98 912 345 6789"]))
+        self.assertTrue(has_iranian_mobile(["۰۹۱۲۳۴۵۶۷۸۹"]))
+        self.assertFalse(has_iranian_mobile(["02112345678", "12345"]))
+        self.assertTrue(has_iranian_mobile(["9123456789"]))
+        self.assertTrue(has_iranian_mobile(["989123456789"]))
+        self.assertFalse(has_iranian_mobile(["9"]))
         self.assertTrue(phone_is_valid("021-12345678"))
         self.assertFalse(phone_is_valid("12345"))
 
@@ -272,6 +278,22 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(self.job.leads.get().source_record_ids["neshan"], search["id"])
         self.assertEqual(LeadEvidence.objects.filter(business_lead__search_job=self.job, field_name="raw_response").count(), 1)
 
+    def test_mobile_discovery_promotes_existing_candidate_to_one_success(self):
+        record = {"id": "b" * 32, "name": "مغازه نمونه", "phone": "02112345678", "address": "تهران"}
+        lead, successful = save_lead(self.job, "neshan", record, {}, return_created=True)
+        self.assertFalse(successful)
+        self.assertFalse(lead.has_mobile_phone)
+
+        record["phone"] = "+98 912 345 6789"
+        promoted, successful = save_lead(self.job, "balad", record, {}, return_created=True)
+        self.assertEqual(promoted.pk, lead.pk)
+        self.assertTrue(successful)
+        self.assertTrue(promoted.has_mobile_phone)
+        self.assertEqual(promoted.phone_numbers, ["02112345678", "09123456789"])
+
+        _, successful_again = save_lead(self.job, "balad", record, {}, return_created=True)
+        self.assertFalse(successful_again)
+
     def test_dedup_uses_narrow_indexed_name_lookup_for_large_jobs(self):
         BusinessLead.objects.bulk_create([
             BusinessLead(search_job=self.job, normalized_name=f"نام {index}", original_name=f"نام {index}")
@@ -368,7 +390,7 @@ class LeadPersistenceTests(TransactionTestCase):
         with patch("leads.sources.source_session", fake_session):
             count = execute_source("neshan", self.job, execution)
         execution.refresh_from_db()
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 0)
         self.assertEqual(self.job.leads.count(), 2)
         self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual(execution.error_count, 1)
@@ -389,7 +411,7 @@ class LeadPersistenceTests(TransactionTestCase):
             async def call(self, tool_name, arguments):
                 self.request_count += 1
                 if tool_name == "ns_search":
-                    return MCPCallResult({"results": [{"id": identifier, "name": "کافه نمونه", "phone": "02112345678", "address": "تهران"}]}, 1)
+                    return MCPCallResult({"results": [{"id": identifier, "name": "کافه نمونه", "phone": "09123456789", "address": "تهران"}]}, 1)
                 raise MCPSourceError("Neshan returned no details for this place. Check the id; get ids from ns_search.")
 
         @asynccontextmanager
@@ -400,7 +422,7 @@ class LeadPersistenceTests(TransactionTestCase):
             self.assertEqual(execute_source("neshan", self.job, execution), 1)
         execution.refresh_from_db()
         lead = self.job.leads.get()
-        self.assertEqual(lead.phone_numbers, ["02112345678"])
+        self.assertEqual(lead.phone_numbers, ["09123456789"])
         self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual(execution.error_count, 0)
         self.assertIn("جزئیات نشان موجود نبود", execution.error_details)
@@ -413,7 +435,7 @@ class LeadPersistenceTests(TransactionTestCase):
         self.job.save(update_fields=["trade_name", "selected_sources", "max_results"])
         execution = SourceExecution.objects.create(search_job=self.job, source_name="neshan")
         identifier = "d" * 32
-        _store_source_detail("neshan", identifier, {"name": "کافه نمونه", "phone": "02112345678", "website": "https://business.example.ir"})
+        _store_source_detail("neshan", identifier, {"name": "کافه نمونه", "phone": "09123456789", "website": "https://business.example.ir"})
 
         class FakeClient:
             request_count = 0
@@ -429,7 +451,7 @@ class LeadPersistenceTests(TransactionTestCase):
         with patch("leads.sources.source_session", fake_session):
             self.assertEqual(execute_source("neshan", self.job, execution), 1)
         lead = self.job.leads.get()
-        self.assertEqual(lead.phone_numbers, ["02112345678"])
+        self.assertEqual(lead.phone_numbers, ["09123456789"])
         self.assertEqual(lead.website, "https://business.example.ir")
         self.assertEqual(execution.request_count, 1)
 
@@ -449,8 +471,8 @@ class LeadPersistenceTests(TransactionTestCase):
                 self.calls.append(tool_name)
                 if tool_name == "ns_search":
                     return MCPCallResult({"results": [
-                        {"id": "a" * 32, "name": "کافه اول", "phone": "02112345678", "address": "تهران ۱"},
-                        {"id": "b" * 32, "name": "کافه دوم", "phone": "02112345679", "address": "تهران ۲"},
+                        {"id": "a" * 32, "name": "کافه اول", "phone": "09123456781", "address": "تهران ۱"},
+                        {"id": "b" * 32, "name": "کافه دوم", "phone": "09123456782", "address": "تهران ۲"},
                     ]}, 1)
                 raise MCPSourceError("neshan rate limiting requests (HTTP 429)")
 
@@ -485,7 +507,7 @@ class LeadPersistenceTests(TransactionTestCase):
         self.job.max_results = 2
         self.job.save(update_fields=["trade_name", "selected_sources", "max_results"])
         execution = SourceExecution.objects.create(search_job=self.job, source_name="balad")
-        record = {"id": "AbCdEf123456", "name": "شیشه فروشی نمونه", "phone": "03112345678", "address": "اصفهان، خیابان نمونه"}
+        record = {"id": "AbCdEf123456", "name": "شیشه فروشی نمونه", "phone": "09123456783", "address": "اصفهان، خیابان نمونه"}
 
         class FakeClient:
             request_count = 0
@@ -543,7 +565,7 @@ class LeadPersistenceTests(TransactionTestCase):
                 data = {
                     "em_search": {"products": [{"id": "product-1", "name": "یخچال نمونه"}]},
                     "em_offers": {"offers": [{"shop_id": "shop-1", "shop_name": "فروشگاه نمونه"}]},
-                    "em_shop": {"shop_id": "shop-1", "name": "فروشگاه نمونه", "phone": "02112345678", "email": "info@example.ir", "website": "https://example.ir", "address": "تهران"},
+                    "em_shop": {"shop_id": "shop-1", "name": "فروشگاه نمونه", "phone": "09123456784", "email": "info@example.ir", "website": "https://example.ir", "address": "تهران"},
                 }[name]
                 return MCPCallResult(data, 1)
 
@@ -560,7 +582,7 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual([name for name, _ in client.calls], ["em_search", "em_offers", "em_shop"])
         self.assertEqual(lead.original_name, "فروشگاه نمونه")
-        self.assertEqual(lead.phone_numbers, ["02112345678"])
+        self.assertEqual(lead.phone_numbers, ["09123456784"])
         self.assertEqual(lead.emails, ["info@example.ir"])
         self.assertTrue(lead.evidence.filter(field_name="emails", source_name="emalls").exists())
 
@@ -593,7 +615,7 @@ class LeadPersistenceTests(TransactionTestCase):
         with patch("leads.sources.source_session", fake_session):
             count = execute_source("basalam", self.job, execution)
         lead = self.job.leads.get()
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 0)
         self.assertEqual(lead.original_name, "غرفه عسل نمونه")
         self.assertEqual(lead.city, "تهران")
         self.assertEqual(lead.business_type, "marketplace_seller")
@@ -930,6 +952,25 @@ class JobAndExportTests(TestCase):
         self.assertEqual(result["status"], SearchJob.Status.PARTIAL)
         self.assertEqual(self.job.total_unique_businesses, 1)
 
+    def test_job_totals_count_only_mobile_qualified_businesses(self):
+        BusinessLead.objects.create(
+            search_job=self.job, normalized_name="شماره ثابت", original_name="شماره ثابت",
+            phone_numbers=["02112345678"],
+        )
+        self.job.total_unique_businesses = 99
+        self.job.save(update_fields=["total_unique_businesses"])
+
+        def complete_source(source, job, execution):
+            execution.status = SourceExecution.Status.COMPLETED
+            execution.save(update_fields=["status"])
+            return 0
+
+        with patch("leads.tasks.execute_source", side_effect=complete_source):
+            result = run_search_job.apply(args=(self.job.pk,)).get()
+        self.job.refresh_from_db()
+        self.assertEqual(result["leads"], 1)
+        self.assertEqual(self.job.total_unique_businesses, 1)
+
     def test_sources_run_in_user_selected_order(self):
         self.job.selected_sources = ["balad", "neshan"]
         self.job.save(update_fields=["selected_sources"])
@@ -1097,6 +1138,7 @@ class JobAndExportTests(TestCase):
             BusinessLead(
                 search_job=self.job, normalized_name=f"کسب و کار آزمایشی {index}",
                 original_name=f"کسب و کار آزمایشی {index}", city="تهران",
+                phone_numbers=["09123456789"], has_mobile_phone=True,
             )
             for index in range(500)
         ])
@@ -1124,3 +1166,20 @@ class JobAndExportTests(TestCase):
         self.assertEqual(payload["results"][0]["emails"], ["public@example.ir"])
         self.assertEqual(payload["results"][0]["confidence_score"], 0.8)
         self.assertEqual(payload["results"][0]["evidence"][0]["source"], "neshan")
+
+    def test_business_without_mobile_is_not_presented_as_a_successful_result(self):
+        without_mobile = BusinessLead.objects.create(
+            search_job=self.job, normalized_name="تلفن ثابت", original_name="تلفن ثابت",
+            phone_numbers=["02112345678"], source_names=["neshan"],
+        )
+        self.client.force_login(self.user)
+        detail = self.client.get(reverse("job_detail", args=[self.job.pk]))
+        self.assertEqual(detail.context["page_obj"].paginator.count, 1)
+        self.assertEqual(detail.context["summary"]["with_phone"], 1)
+        self.assertEqual(detail.context["summary"]["without_phone"], 1)
+        self.assertEqual(self.client.get(reverse("lead_detail", args=[self.job.pk, without_mobile.pk])).status_code, 404)
+
+        payload = json.loads(self.client.get(reverse("export_json", args=[self.job.pk])).content)
+        self.assertEqual([item["name"] for item in payload["results"]], [self.lead.original_name])
+        workbook = load_workbook(BytesIO(self.client.get(reverse("export_excel", args=[self.job.pk])).content), read_only=True)
+        self.assertEqual(workbook["سرنخ‌ها"].max_row, 2)
