@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, patch
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.management import call_command, CommandError
+from django.db import connection
 from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from mcp.types import TextContent
@@ -20,9 +22,10 @@ from openpyxl import load_workbook
 from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, QueraCompanyAdapter, RasmioAdapter, SnappShopAdapter, TorobShopAdapter, _arguments
 from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, SOURCE_REGISTRY, decode_result
 from .forms import SearchJobForm
-from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
+from .models import BusinessLead, LeadEvidence, QueryExpansionCache, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
 from .normalization import normalize_phone, normalize_text, normalize_website, phone_is_valid
-from .sources import _cached_source_detail, _store_source_detail, calculate_source_budget, calculate_source_call_allowance, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
+from .query_expansion import category_for_query, expand_query
+from .sources import _cached_source_detail, _catalog_page_fingerprint, _find_match, _is_repeated_catalog_page, _store_source_detail, calculate_source_budget, calculate_source_call_allowance, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
 from .tasks import recover_stale_search_jobs, run_search_job
 
 
@@ -50,6 +53,13 @@ class NormalizationTests(TestCase):
         self.assertEqual(calculate_source_call_allowance(100, 40, 5, 5, 3), 35)
         self.assertEqual(calculate_source_call_allowance(100, 40, 5, 80, 0), 20)
         self.assertEqual(calculate_source_call_allowance(100, 40, 2, 0, 1), 40)
+
+    def test_repeated_catalog_page_is_detected_without_marking_same_page_resume(self):
+        page = [({"_source_id": "shop-1", "name": "فروشگاه نمونه"}, {})]
+        fingerprint = _catalog_page_fingerprint(page)
+        history = [{"page": 1, "hash": fingerprint}]
+        self.assertTrue(_is_repeated_catalog_page(fingerprint, history, current_page=2))
+        self.assertFalse(_is_repeated_catalog_page(fingerprint, history, current_page=1))
 
     def test_generic_trade_variants_normalize_persian_plural_and_shop_wording(self):
         self.assertEqual(get_trade_variants("شیشه فروشی های"), ["شیشه فروشی", "فروشگاه شیشه", "شیشه سرای"])
@@ -83,6 +93,63 @@ class NormalizationTests(TestCase):
         self.assertIn("شرکت کافه", get_source_query_variants("کافه", "rasmio"))
         self.assertEqual(get_source_query_variants("کافه", "neshan"), ["کافه"])
 
+    def test_category_name_search_expands_to_the_whole_known_category(self):
+        result = expand_query("تکنولوژی")
+        self.assertEqual(result["category"]["key"], "technology")
+        variants = get_source_query_variants("تکنولوژی", "neshan", result)
+        self.assertIn("فناوری اطلاعات", variants)
+        self.assertIn("شرکت نرم افزاری", variants)
+        self.assertEqual(variants[0], "تکنولوژی")
+
+    def test_category_aliases_respect_persian_normalization(self):
+        self.assertEqual(category_for_query("فناوري اطلاعات")["key"], "technology")
+
+    def test_query_expansion_keeps_original_and_uses_deterministic_fallback(self):
+        with self.settings(SEARCH_QUERY_LLM_ENABLED=False):
+            result = expand_query("شیشه فروشی های")
+        self.assertEqual(result["original_query"], "شیشه فروشی های")
+        self.assertEqual(result["provider"], "deterministic")
+        self.assertLessEqual(len(result["variants"]), settings.SEARCH_QUERY_MAX_VARIANTS)
+
+    def test_llm_expansion_is_validated_and_cached(self):
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"choices": [{"message": {"content": json.dumps({"variants": [
+                {"query": "شرکت نرم افزاری", "type": "synonym", "relevance": 0.95},
+                {"query": "رستوران", "type": "irrelevant", "relevance": 0.1},
+                {"query": "شرکت نرم افزاری", "type": "duplicate", "relevance": 1.0},
+            ]})}}]},
+        )
+        config = {
+            "SEARCH_QUERY_LLM_ENABLED": True, "SEARCH_QUERY_LLM_BASE_URL": "https://llm.example/v1",
+            "SEARCH_QUERY_LLM_API_KEY": "test-key", "SEARCH_QUERY_LLM_MODEL": "test-model",
+            "SEARCH_QUERY_MIN_RELEVANCE": 0.7,
+        }
+        with self.settings(**config), patch("leads.query_expansion.httpx.post", return_value=response) as post:
+            first = expand_query("شرکت‌های فناوری")
+            second = expand_query("شرکت‌های فناوری")
+        self.assertEqual(first, second)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(len(first["variants"]), 1)
+        self.assertEqual(first["variants"][0]["query"], "شرکت نرم افزاری")
+        self.assertEqual(QueryExpansionCache.objects.count(), 1)
+
+    def test_llm_failure_falls_back_without_failing_search(self):
+        with self.settings(
+            SEARCH_QUERY_LLM_ENABLED=True, SEARCH_QUERY_LLM_BASE_URL="https://llm.example/v1",
+            SEARCH_QUERY_LLM_API_KEY="test-key", SEARCH_QUERY_LLM_MODEL="test-model",
+        ), patch("leads.query_expansion.httpx.post", side_effect=__import__("httpx").TimeoutException("timeout")):
+            result = expand_query("شیشه فروشی های")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["original_query"], "شیشه فروشی های")
+        self.assertTrue(any(item["query"] == "شیشه فروشی" for item in result["variants"]))
+
+    def test_form_accepts_5000_and_rejects_values_above_configured_limit(self):
+        data = {"trade_name": "تکنولوژی", "geographic_scope_type": "city", "geographic_scope_name": "تهران", "sources": ["neshan"], "max_results": 5000}
+        self.assertTrue(SearchJobForm(data=data).is_valid())
+        data["max_results"] = 5001
+        self.assertFalse(SearchJobForm(data=data).is_valid())
+
     def test_adapter_maps_only_schema_supported_search_arguments(self):
         tool = SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "city": {"type": "string"}, "page_size": {"type": "integer"}}, "required": ["query"]})
         client = SimpleNamespace(tools={"rs_search_companies": tool})
@@ -104,12 +171,31 @@ class NormalizationTests(TestCase):
             return MCPCallResult({"companies": rows}, 1)
         async def run():
             return await RasmioAdapter().discover(FakeClient(), invoke, "شرکت نرم‌افزاری", "اصفهان", "", 40)
-        result = asyncio.run(run())
+        with self.settings(SEARCH_PAGES_PER_BATCH=2):
+            result = asyncio.run(run())
         rows = result.records
         self.assertEqual(len(rows), 21)
         self.assertEqual(rows[0][0]["national_id"], "10100360700")
         self.assertEqual(calls[0][0], "rs_search_companies")
         self.assertEqual([call[1]["page"] for call in calls], [1, 2])
+
+    def test_rasmio_adapter_returns_a_page_checkpoint_and_resumes_from_it(self):
+        class FakeClient:
+            tools = {"rs_search_companies": SimpleNamespace(input_schema={"type": "object", "properties": {"query": {"type": "string"}, "page": {"type": "integer"}, "page_size": {"type": "integer"}}, "required": ["query"]})}
+        called_pages = []
+        async def invoke(client, name, arguments):
+            called_pages.append(arguments["page"])
+            rows = [{"company_id": str(index), "name": f"شرکت {index}"} for index in range(20)] if arguments["page"] == 1 else [{"company_id": "last", "name": "شرکت آخر"}]
+            return MCPCallResult({"companies": rows}, 1)
+        async def run(start_page):
+            return await RasmioAdapter().discover(FakeClient(), invoke, "شرکت", "", "", 40, start_page=start_page)
+        with self.settings(SEARCH_PAGES_PER_BATCH=1):
+            first = asyncio.run(run(1))
+            second = asyncio.run(run(first.next_page))
+        self.assertEqual(first.next_page, 2)
+        self.assertEqual(len(first.records), 20)
+        self.assertIsNone(second.next_page)
+        self.assertEqual(called_pages, [1, 2])
 
     def test_new_source_adapters_convert_company_or_seller_records(self):
         class FakeClient:
@@ -185,6 +271,20 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(self.job.leads.count(), 1)
         self.assertEqual(self.job.leads.get().source_record_ids["neshan"], search["id"])
         self.assertEqual(LeadEvidence.objects.filter(business_lead__search_job=self.job, field_name="raw_response").count(), 1)
+
+    def test_dedup_uses_narrow_indexed_name_lookup_for_large_jobs(self):
+        BusinessLead.objects.bulk_create([
+            BusinessLead(search_job=self.job, normalized_name=f"نام {index}", original_name=f"نام {index}")
+            for index in range(300)
+        ])
+        target = BusinessLead.objects.create(search_job=self.job, normalized_name="فروشگاه هدف", original_name="فروشگاه هدف", city="تهران", phone_numbers=["09123456789"])
+        data = {"phones": ["09123456789"], "name": "فروشگاه هدف", "address": "", "national_id": "", "website": "", "city": "تهران"}
+        with CaptureQueriesContext(connection) as captured:
+            matched = _find_match(self.job, "neshan", "absent-id", data)
+        lead_queries = [query for query in captured.captured_queries if "FROM \"leads_businesslead\"" in query["sql"]]
+        self.assertEqual(matched.pk, target.pk)
+        self.assertEqual(len(lead_queries), 2)
+        self.assertIn("normalized_name", lead_queries[-1]["sql"])
 
     def test_internal_fair_share_exhaustion_is_a_non_error_terminal_source_state(self):
         self.job.selected_sources = ["neshan"]
@@ -270,7 +370,7 @@ class LeadPersistenceTests(TransactionTestCase):
         execution.refresh_from_db()
         self.assertEqual(count, 2)
         self.assertEqual(self.job.leads.count(), 2)
-        self.assertEqual(execution.status, SourceExecution.Status.PARTIAL)
+        self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual(execution.error_count, 1)
         self.assertIn("detail endpoint unavailable", execution.error_details)
         self.assertEqual(SourceToolCall.objects.filter(source_execution=execution, error_summary__gt="").count(), 1)
@@ -301,7 +401,7 @@ class LeadPersistenceTests(TransactionTestCase):
         execution.refresh_from_db()
         lead = self.job.leads.get()
         self.assertEqual(lead.phone_numbers, ["02112345678"])
-        self.assertEqual(execution.status, SourceExecution.Status.COMPLETED)
+        self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual(execution.error_count, 0)
         self.assertIn("جزئیات نشان موجود نبود", execution.error_details)
         self.assertEqual(_cached_source_detail("neshan", identifier), {})
@@ -408,13 +508,13 @@ class LeadPersistenceTests(TransactionTestCase):
             count = execute_source("balad", self.job, execution)
         execution.refresh_from_db()
         self.assertEqual(count, 1)
-        self.assertEqual(execution.status, SourceExecution.Status.COMPLETED)
-        self.assertEqual([call[0] for call in client.calls], ["bl_nearby", "bl_place", "bl_nearby", "bl_nearby"])
-        self.assertEqual(client.calls[0][1]["what"], "شیشه فروشی")
+        self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
+        self.assertEqual([call[0] for call in client.calls], ["bl_nearby", "bl_place"])
+        self.assertEqual(client.calls[0][1]["what"], "شیشه فروشی های")
         self.assertEqual(client.calls[0][1]["radius_km"], 20)
-        self.assertEqual(client.calls[2][1]["what"], "فروشگاه شیشه")
         self.assertEqual(self.job.leads.get().source_record_ids["balad"], record["id"])
-        self.assertIn("شیشه فروشی", execution.query_variants)
+        self.assertEqual(execution.query_variants, ["شیشه فروشی های"])
+        self.assertEqual(execution.checkpoint["variant_index"], 1)
         self.assertEqual(execution.areas_checked, ["تهران"])
 
     def test_emalls_product_offers_pipeline_saves_public_shop_profile_with_evidence(self):
@@ -457,7 +557,7 @@ class LeadPersistenceTests(TransactionTestCase):
         execution.refresh_from_db()
         lead = self.job.leads.get()
         self.assertEqual(count, 1)
-        self.assertEqual(execution.status, SourceExecution.Status.COMPLETED)
+        self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual([name for name, _ in client.calls], ["em_search", "em_offers", "em_shop"])
         self.assertEqual(lead.original_name, "فروشگاه نمونه")
         self.assertEqual(lead.phone_numbers, ["02112345678"])
@@ -966,6 +1066,23 @@ class JobAndExportTests(TestCase):
             result = run_search_job.apply(args=(self.job.pk,)).get()
         self.assertEqual(result["status"], SearchJob.Status.COMPLETED)
 
+    def test_job_requeues_after_a_source_checkpoint_without_losing_results(self):
+        def save_checkpoint(source, job, execution):
+            execution.status = SourceExecution.Status.QUEUED
+            execution.checkpoint = {"kind": "catalog", "variant_index": 1, "page": 1}
+            execution.request_count += 1
+            execution.save(update_fields=["status", "checkpoint", "request_count"])
+            return 0
+        with patch("leads.tasks.execute_source", side_effect=save_checkpoint) as execute, \
+             patch("leads.tasks.run_search_job.apply_async", return_value=SimpleNamespace(id="next-batch")) as enqueue:
+            result = run_search_job.apply(args=(self.job.pk,)).get()
+        self.job.refresh_from_db()
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(result["status"], SearchJob.Status.QUEUED)
+        self.assertEqual(self.job.status, SearchJob.Status.QUEUED)
+        self.assertTrue(all(item.checkpoint for item in self.job.source_executions.all()))
+        enqueue.assert_called_once()
+
     def test_excel_has_lead_and_evidence_sheets(self):
         self.client.force_login(self.user)
         response = self.client.get(reverse("export_excel", args=[self.job.pk]))
@@ -974,6 +1091,19 @@ class JobAndExportTests(TestCase):
         self.assertEqual(workbook["سرنخ‌ها"]["A1"].value, "نام کسب‌وکار")
         self.assertIn("ایمیل عمومی", [cell.value for cell in workbook["سرنخ‌ها"][1]])
         self.assertEqual(workbook["شواهد"].max_row, 2)
+
+    def test_excel_export_includes_more_than_500_leads(self):
+        BusinessLead.objects.bulk_create([
+            BusinessLead(
+                search_job=self.job, normalized_name=f"کسب و کار آزمایشی {index}",
+                original_name=f"کسب و کار آزمایشی {index}", city="تهران",
+            )
+            for index in range(500)
+        ])
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("export_excel", args=[self.job.pk]))
+        workbook = load_workbook(BytesIO(response.content), read_only=True)
+        self.assertEqual(workbook["سرنخ‌ها"].max_row, 502)
 
     def test_search_and_exports_require_owner(self):
         self.client.force_login(self.user)

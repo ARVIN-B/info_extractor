@@ -1,6 +1,7 @@
 import asyncio
 from difflib import SequenceMatcher
 from datetime import timedelta
+import hashlib
 import json
 import logging
 import math
@@ -121,10 +122,8 @@ def get_scope_points(job):
 
 
 def calculate_source_budget(max_results, selected_source_count, remaining_results, completed_sources_before):
-    fair_share = math.ceil(max_results / max(1, selected_source_count))
-    if completed_sources_before < selected_source_count - 1:
-        return min(remaining_results, fair_share)
-    return remaining_results
+    eligible = max(1, selected_source_count - completed_sources_before)
+    return min(remaining_results, math.ceil(remaining_results / eligible))
 
 
 def calculate_source_call_allowance(max_total_calls, max_source_calls, selected_source_count, calls_already_used, other_pending_sources):
@@ -138,6 +137,21 @@ def calculate_source_call_allowance(max_total_calls, max_source_calls, selected_
         max_source_calls,
         max(0, max_total_calls - calls_already_used - reserved_for_others),
     )
+
+
+def _catalog_page_fingerprint(candidates):
+    identities = sorted(
+        str(record.get("_source_id") or _first(record, "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id") or normalize_text(str(record.get("name", ""))))
+        for record, _detail in candidates
+    )
+    return hashlib.sha256("\n".join(identities).encode("utf-8")).hexdigest() if identities else ""
+
+
+def _is_repeated_catalog_page(fingerprint, history, current_page):
+    return bool(fingerprint and any(
+        item.get("hash") == fingerprint and item.get("page") != current_page
+        for item in history if isinstance(item, dict)
+    ))
 
 
 def _records(data):
@@ -283,7 +297,7 @@ def _store_source_detail(source, record_id, detail, cache_empty=False):
 
 def _find_match(job, source, record_id, data):
     current = BusinessLead.objects.filter(search_job=job)
-    existing = next((lead for lead in current if lead.source_record_ids.get(source) == str(record_id)), None)
+    existing = current.filter(**{f"source_record_ids__{source}": str(record_id)}).first() if record_id else None
     if existing:
         return existing
     phones = {normalize_phone(phone) for phone in data["phones"] if normalize_phone(phone)}
@@ -292,10 +306,13 @@ def _find_match(job, source, record_id, data):
     if not name:
         return None
     national_id = re.sub(r"\D", "", data.get("national_id", ""))
+    if national_id:
+        existing = current.filter(national_id=national_id).exclude(national_id="").first()
+        if existing:
+            return existing
     website, domain = normalize_website(data["website"])
-    for candidate in current.prefetch_related("evidence"):
-        if national_id and candidate.national_id == national_id:
-            return candidate
+    candidate_rows = current.filter(normalized_name=name)
+    for candidate in candidate_rows.iterator(chunk_size=200):
         candidate_phones = {normalize_phone(phone) for phone in candidate.phone_numbers if normalize_phone(phone)}
         same_location = normalize_text(candidate.address) == address
         same_name = candidate.normalized_name == name
@@ -314,7 +331,7 @@ def _find_match(job, source, record_id, data):
 
 
 @transaction.atomic
-def save_lead(job, source, search_record, detail):
+def save_lead(job, source, search_record, detail, return_created=False):
     record_id = _first(search_record, "_source_id", "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id") or _first(detail if isinstance(detail, dict) else {}, "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id")
     if not record_id:
         return None
@@ -327,6 +344,7 @@ def save_lead(job, source, search_record, detail):
     invalid_phone_values = [str(phone).strip() for phone in fields["phones"] if str(phone).strip() and not phone_is_valid(phone)]
     all_phone_values = list(dict.fromkeys(valid_phones))
     lead = _find_match(job, source, record_id, fields)
+    created = lead is None
     source_ids = dict(lead.source_record_ids) if lead else {}
     source_ids[source] = record_id
     sources = list(dict.fromkeys((lead.source_names if lead else []) + [source]))
@@ -426,7 +444,7 @@ def save_lead(job, source, search_record, detail):
         field_name="raw_response", field_value="Original search and detail response",
         defaults={"source_url": fields["profile_url"] or _source_url(source, record_id), "raw_response": raw},
     )
-    return lead
+    return (lead, created) if return_created else lead
 
 
 def _normalized_evidence_value(field_name, value):
@@ -515,13 +533,18 @@ def _remember_source_rate_limit(source, error):
     return state.cooldown_until
 
 
-def get_source_query_variants(trade_name, source):
+def get_source_query_variants(trade_name, source, expansion=None):
     """Add source-specific nearby searches instead of excluding a catalog source."""
     query = normalize_text(trade_name)
     online = any(term in query for term in ("فروشگاه اینترنتی", "فروشگاه آنلاین", "آنلاین", "اینترنتی", "مارکت پلیس"))
     small_market = any(term in query for term in ("باسلام", "صنایع دستی", "خانگی", "دست ساز", "محصولات محلی"))
     company = any(term in query for term in ("شرکت", "سهامی", "حقوقی", "ثبت شده", "نرم افزار", "فناوری", "صنعتی", "تولیدی", "کارخانه"))
-    variants = get_trade_variants(trade_name)
+    expanded = expansion or {}
+    variants = [trade_name]
+    category = expanded.get("category")
+    if category:
+        variants.extend(category.get("aliases", []))
+    variants.extend(get_trade_variants(trade_name))
     if source == "emalls" and not online:
         variants.extend(f"فروشگاه {item}" for item in variants[:2])
     elif source == "basalam" and not (online or small_market):
@@ -530,7 +553,9 @@ def get_source_query_variants(trade_name, source):
         variants.extend(f"شرکت {item}" for item in variants[:2])
     elif source in {"iran_jobs", "quera"} and not company:
         variants.extend(f"شرکت {item}" for item in variants[:2])
-    return list(dict.fromkeys(item.strip() for item in variants if item.strip()))[:5]
+    variants.extend(item.get("query", "") for item in expanded.get("variants", []) if isinstance(item, dict))
+    maximum = max(1, settings.SEARCH_QUERY_MAX_VARIANTS + 1)
+    return list(dict.fromkeys(item.strip() for item in variants if item.strip()))[:maximum]
 
 
 async def _search_catalog_source(source, job, execution, adapter, client, invoke, source_budget, variants):
@@ -538,7 +563,13 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
     province = job.geographic_scope_name if job.geographic_scope_type == SearchJob.ScopeType.PROVINCE else ""
     saved, errors, was_rate_limited = 0, [], False
     processed_ids = set()
-    for variant in variants:
+    checkpoint = dict(execution.checkpoint or {})
+    variant_index = max(0, int(checkpoint.get("variant_index", 0)))
+    start_page = int(checkpoint.get("page", 0 if source == "torob" else 1))
+    record_offset = max(0, int(checkpoint.get("record_offset", 0)))
+    for index in range(variant_index, len(variants)):
+        variant = variants[index]
+        discovery = None
         if variant not in execution.query_variants:
             execution.query_variants = [*execution.query_variants, variant]
         area = city or province or "ایران"
@@ -548,10 +579,11 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
         try:
             discovery = await adapter.discover(
                 client=client, invoke=invoke, query=variant, city=city, province=province,
-                limit=source_budget - saved,
+                limit=job.max_results,
+                start_page=start_page if index == variant_index else (0 if source == "torob" else 1),
             )
             candidates = discovery.records
-            execution.truncated = execution.truncated or discovery.truncated
+            execution.truncated = execution.truncated or (discovery.truncated and discovery.next_page is None)
         except MCPSourceError as exc:
             candidates = getattr(exc, "partial_records", [])
             execution.truncated = execution.truncated or getattr(exc, "truncated", False)
@@ -564,8 +596,21 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
                 execution.error_details = str(exc)[:2000]
             else:
                 errors.append(str(exc))
-        for record, detail in candidates:
+        current_page = start_page if index == variant_index else (0 if source == "torob" else 1)
+        page_fingerprint = _catalog_page_fingerprint(candidates)
+        prior_fingerprints = checkpoint.get("page_fingerprints", []) if index == variant_index else []
+        repeated_page = _is_repeated_catalog_page(page_fingerprint, prior_fingerprints, current_page)
+        if repeated_page:
+            candidates_to_save = []
+            execution.truncated = True
+        else:
+            candidates_to_save = candidates
+        resume_offset = None
+        for record_index, (record, detail) in enumerate(candidates_to_save):
+            if index == variant_index and record_index < record_offset:
+                continue
             if saved >= source_budget:
+                resume_offset = record_index
                 break
             record = dict(record)
             stable_id = str(record.get("_source_id") or _first(record, "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id") or "")
@@ -584,15 +629,54 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
             record["_searched_city"] = actual_city or city or province
             if record.get("_source_id"):
                 record.setdefault("id", record["_source_id"])
-            lead = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail)
-            if lead:
+            lead, created = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail, return_created=True)
+            if lead and created:
                 saved += 1
         execution.result_count += len(candidates)
         await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["result_count"])
+        if resume_offset is not None:
+            execution.checkpoint = {"kind": "catalog", "variant_index": index, "page": current_page, "record_offset": resume_offset, "page_fingerprints": prior_fingerprints}
+            execution.status = SourceExecution.Status.QUEUED
+            execution.completed_at = None
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint", "status", "completed_at"])
+            return saved
+        if was_rate_limited:
+            execution.checkpoint = {
+                "kind": "catalog", "variant_index": index,
+                "page": current_page,
+                "record_offset": len(candidates),
+                "page_fingerprints": prior_fingerprints,
+            }
+            execution.status = SourceExecution.Status.LONG_COOLDOWN if execution.error_type == "long_cooldown" else SourceExecution.Status.RATE_LIMITED
+            execution.completed_at = timezone.now()
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint", "status", "completed_at", "cooldown_until", "error_type", "error_details"])
+            return saved
+        next_page = None if repeated_page else getattr(discovery, "next_page", None)
+        if next_page is not None:
+            fingerprints = [item for item in prior_fingerprints if isinstance(item, dict)]
+            if page_fingerprint:
+                fingerprints = [*fingerprints, {"page": current_page, "hash": page_fingerprint}]
+            execution.checkpoint = {"kind": "catalog", "variant_index": index, "page": next_page, "record_offset": 0, "page_fingerprints": fingerprints[-settings.SEARCH_MAX_PAGES_PER_SOURCE:]}
+            execution.status = SourceExecution.Status.QUEUED
+            execution.completed_at = None
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint", "status", "completed_at"])
+            return saved
+        execution.checkpoint = {"kind": "catalog", "variant_index": index + 1, "page": 0 if source == "torob" else 1, "record_offset": 0}
+        await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint"])
         if errors or saved >= source_budget:
             if saved >= source_budget:
-                execution.truncated = True
+                if index + 1 < len(variants):
+                    execution.status = SourceExecution.Status.QUEUED
+                    execution.completed_at = None
+                    await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["status", "completed_at"])
+                    return saved
             break
+        # One query variant per Celery invocation keeps MCP work and task duration bounded.
+        if index + 1 < len(variants):
+            execution.status = SourceExecution.Status.QUEUED
+            execution.completed_at = None
+            await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["status", "completed_at"])
+            return saved
     if errors:
         execution.status = SourceExecution.Status.PARTIAL if execution.result_count else SourceExecution.Status.FAILED
         execution.error_count += len(errors)
@@ -608,12 +692,13 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
 
 
 async def _search_source(source, job, execution):
+    initial_request_count = execution.request_count
     config = SOURCE_REGISTRY[source]
     geocode_tool = config["tools"]["search"]
     search_tool = config["tools"].get("nearby", geocode_tool)
     detail_tool = config["tools"].get("detail")
     
-    variants = get_source_query_variants(job.trade_name, source)
+    variants = get_source_query_variants(job.trade_name, source, getattr(job, "query_expansion", {}))
     scope_points = get_scope_points(job)
     remaining = max(0, job.max_results - await sync_to_async(job.leads.count, thread_sensitive=True)())
     if remaining == 0:
@@ -677,15 +762,17 @@ async def _search_source(source, job, execution):
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
             raise MCPBudgetExhausted(f"{source} reached its fair share; remaining calls are reserved for other selected sources.")
-        if client.request_count >= settings.SOURCE_MAX_CALLS_PER_JOB:
+        if execution.request_count + client.request_count >= settings.SOURCE_MAX_CALLS_PER_JOB:
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["truncated"])
             raise MCPBudgetExhausted(f"{source} reached its per-source call budget.")
-        client.request_allowance = source_call_allowance
+        batch_remaining = settings.SOURCE_MAX_CALLS_PER_BATCH - client.request_count
+        lifetime_remaining = settings.SOURCE_MAX_CALLS_PER_JOB - execution.request_count
+        client.request_allowance = min(source_call_allowance, batch_remaining, lifetime_remaining)
         try:
             result = await client.call(tool_name, arguments)
         except MCPBudgetExhausted as exc:
-            execution.request_count = client.request_count
+            execution.request_count = initial_request_count + client.request_count
             execution.truncated = True
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "truncated"])
             await sync_to_async(SourceToolCall.objects.create, thread_sensitive=True)(
@@ -696,7 +783,7 @@ async def _search_source(source, job, execution):
         except MCPSourceError as exc:
             if exc.rate_limited:
                 await sync_to_async(_remember_source_rate_limit, thread_sensitive=True)(source, exc)
-            execution.request_count = client.request_count
+            execution.request_count = initial_request_count + client.request_count
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
             await sync_to_async(SourceToolCall.objects.create, thread_sensitive=True)(
                 source_execution=execution, tool_name=tool_name, duration_ms=exc.duration_ms,
@@ -705,7 +792,7 @@ async def _search_source(source, job, execution):
             execution.retry_count += exc.retry_count
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["retry_count"])
             raise
-        execution.request_count = client.request_count
+        execution.request_count = initial_request_count + client.request_count
         await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
         await sync_to_async(SourceToolCall.objects.create, thread_sensitive=True)(
             source_execution=execution, tool_name=tool_name, duration_ms=result.duration_ms,
@@ -732,7 +819,7 @@ async def _search_source(source, job, execution):
             if source == "neshan":
                 resolve_args["near"] = "Tehran"
             resolved = await invoke(client, geocode_tool, resolve_args)
-            execution.request_count = client.request_count
+            execution.request_count = initial_request_count + client.request_count
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
             wanted = normalize_text(scope_points[0][0])
             candidates = [r for r in _records(resolved.data) if _float_or_none(r.get("lat")) is not None and _float_or_none(r.get("lng")) is not None]
@@ -741,12 +828,19 @@ async def _search_source(source, job, execution):
                 raise MCPSourceError(f"Could not resolve the {job.geographic_scope_type} location in {source}")
             scope_points = [(scope_points[0][0], (float(location["lat"]), float(location["lng"]))) ]
         per_location_budget = max(1, source_budget // max(1, len(scope_points)))
-        for place_name, point in scope_points:
+        map_checkpoint = dict(execution.checkpoint or {})
+        first_area = max(0, int(map_checkpoint.get("area_index", 0)))
+        first_variant = max(0, int(map_checkpoint.get("variant_index", 0)))
+        record_offset = max(0, int(map_checkpoint.get("record_offset", 0)))
+        for area_index in range(first_area, len(scope_points)):
+            place_name, point = scope_points[area_index]
             if place_name not in execution.areas_checked:
                 execution.areas_checked = [*execution.areas_checked, place_name]
                 await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["areas_checked"])
             location_saved = 0
-            for variant in variants:
+            variant_start = first_variant if area_index == first_area else 0
+            for variant_index in range(variant_start, len(variants)):
+                variant = variants[variant_index]
                 if saved >= source_budget or location_saved >= per_location_budget:
                     break
                 if source == "neshan":
@@ -764,10 +858,17 @@ async def _search_source(source, job, execution):
                     execution.query_variants = [*execution.query_variants, variant]
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["query_variants"])
                 result = await invoke(client, search_tool, args)
-                execution.request_count = client.request_count
+                execution.request_count = initial_request_count + client.request_count
                 execution.result_count += len(_records(result.data))
                 await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "result_count"])
-                for record in _records(result.data):
+                records = _records(result.data)
+                resume_offset = None
+                for record_index, record in enumerate(records):
+                    if area_index == first_area and variant_index == first_variant and record_index < record_offset:
+                        continue
+                    if saved >= source_budget or location_saved >= per_location_budget:
+                        resume_offset = record_index
+                        break
                     identifier = _first(record, "id", "place_id", "token")
                     if not identifier or str(identifier) in processed_ids:
                         continue
@@ -800,20 +901,37 @@ async def _search_source(source, job, execution):
                                 execution.error_count += 1
                             execution.error_details = "\n".join([*detail_errors, *detail_warnings])[-2000:]
                             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "error_count", "error_details"])
-                    execution.request_count = client.request_count
+                    execution.request_count = initial_request_count + client.request_count
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
                     record["_searched_city"] = place_name
-                    lead = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail_data)
-                    if lead:
+                    lead, created = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail_data, return_created=True)
+                    if lead and created:
                         saved += 1
                         location_saved += 1
-                    if saved >= source_budget or location_saved >= per_location_budget:
-                        execution.truncated = True
-                        break
+                if resume_offset is not None:
+                    execution.checkpoint = {"kind": "map", "area_index": area_index, "variant_index": variant_index, "record_offset": resume_offset}
+                    execution.status = SourceExecution.Status.QUEUED
+                    execution.completed_at = None
+                    await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint", "status", "completed_at"])
+                    return saved
+                if detail_rate_limited:
+                    execution.checkpoint = {"kind": "map", "area_index": area_index, "variant_index": variant_index, "record_offset": len(records)}
+                    break
+                next_area, next_variant = area_index, variant_index + 1
+                if next_variant >= len(variants):
+                    next_area, next_variant = area_index + 1, 0
+                execution.checkpoint = {"kind": "map", "area_index": next_area, "variant_index": next_variant, "record_offset": 0}
+                await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint"])
+                if detail_rate_limited:
+                    break
+                if next_area < len(scope_points) or next_variant < len(variants):
+                    execution.status = SourceExecution.Status.QUEUED
+                    execution.completed_at = None
+                    await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["status", "completed_at"])
+                    return saved
                 if detail_rate_limited:
                     break
             if saved >= source_budget:
-                execution.truncated = True
                 break
             if detail_rate_limited:
                 break
@@ -829,7 +947,8 @@ async def _search_source(source, job, execution):
 def execute_source(source, job, execution):
     execution.status = SourceExecution.Status.RUNNING
     execution.started_at = timezone.now()
-    execution.save(update_fields=["status", "started_at"])
+    execution.last_attempt_at = execution.started_at
+    execution.save(update_fields=["status", "started_at", "last_attempt_at"])
     try:
         return asyncio.run(_search_source(source, job, execution))
     except SearchCancelled:

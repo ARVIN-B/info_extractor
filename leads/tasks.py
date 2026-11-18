@@ -9,6 +9,7 @@ from django.utils import timezone
 from .models import BusinessLead, SearchJob, SourceExecution
 from .mcp_client import SOURCE_REGISTRY
 from .sources import execute_source
+from .query_expansion import expand_query
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,16 @@ def run_search_job(self, job_id):
         status = SearchJob.objects.filter(pk=job_id).values_list("status", flat=True).first()
         return {"status": status or "missing"}
     job = SearchJob.objects.get(pk=job_id)
+
+    if not job.query_expansion:
+        try:
+            job.query_expansion = expand_query(job.trade_name)
+        except Exception:
+            # Expansion is an enhancement; the source pipeline always receives
+            # the original query if cache/database/provider expansion fails.
+            logger.exception("Query expansion failed for job %s; using original query", job_id)
+            job.query_expansion = {"original_query": job.trade_name, "variants": [], "success": False}
+        job.save(update_fields=["query_expansion"])
 
     success_count = job.source_executions.filter(status=SourceExecution.Status.COMPLETED).count()
     try:
@@ -43,8 +54,12 @@ def run_search_job(self, job_id):
                 continue
             if execution.status == SourceExecution.Status.COMPLETED:
                 continue
+            if execution.status == SourceExecution.Status.BUDGET_EXHAUSTED:
+                continue
+            if execution.status in {SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN} and execution.cooldown_until and execution.cooldown_until > timezone.now():
+                continue
             execute_source(execution.source_name, job, execution)
-            execution.refresh_from_db(fields=["status", "error_type"])
+            execution.refresh_from_db(fields=["status", "error_type", "cooldown_until"])
             if execution.status == SourceExecution.Status.COMPLETED:
                 success_count += 1
             if settings.SOURCE_FALLBACK_ENABLED and execution.error_type in {"rate_limit", "long_cooldown"}:
@@ -73,17 +88,27 @@ def run_search_job(self, job_id):
             job.total_unique_businesses = job.leads.count()
             job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
             job.save(update_fields=["total_raw_results", "total_unique_businesses", "total_errors"])
+        pending = job.source_executions.filter(status=SourceExecution.Status.QUEUED).exists()
+        if pending:
+            queued = SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.RUNNING).update(
+                status=SearchJob.Status.QUEUED, started_at=None, completed_at=None,
+            )
+            if queued:
+                continuation = run_search_job.apply_async(args=[job_id], countdown=0)
+                SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.QUEUED).update(celery_task_id=continuation.id)
+                return {"status": SearchJob.Status.QUEUED, "leads": job.leads.count(), "continuing": True}
         real_failure_statuses = [SourceExecution.Status.PARTIAL, SourceExecution.Status.FAILED]
         errors = list(job.source_executions.filter(status__in=real_failure_statuses).values_list("source_name", "error_details"))
         limited_sources = job.source_executions.filter(status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN]).count()
         job.error_summary = "\n".join(f"{source}: {message}" for source, message in errors)
         if limited_sources and not errors:
             job.error_summary = "برخی منابع محدودیت دسترسی موقت داشتند؛ نتایج منابع در دسترس جمع‌آوری شدند."
-        long_cooldown = job.source_executions.filter(
-            status=SourceExecution.Status.LONG_COOLDOWN, cooldown_until__gt=timezone.now()
+        active_cooldown = job.source_executions.filter(
+            status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN],
+            cooldown_until__gt=timezone.now(),
         ).order_by("cooldown_until").first()
-        if long_cooldown and not errors:
-            delay = max(1, int((long_cooldown.cooldown_until - timezone.now()).total_seconds()))
+        if active_cooldown and not errors:
+            delay = max(1, int((active_cooldown.cooldown_until - timezone.now()).total_seconds()))
             queued = SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.RUNNING).update(
                 status=SearchJob.Status.QUEUED, completed_at=None,
             )
@@ -92,7 +117,9 @@ def run_search_job(self, job_id):
                 SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.QUEUED).update(celery_task_id=continuation.id)
                 return {"status": SearchJob.Status.QUEUED, "leads": job.leads.count(), "resume_in_seconds": delay}
         has_results = job.leads.exists()
-        job.status = SearchJob.Status.FAILED if errors and not success_count and not has_results else (SearchJob.Status.PARTIAL if errors else SearchJob.Status.COMPLETED)
+        budget_stops = job.source_executions.filter(status=SourceExecution.Status.BUDGET_EXHAUSTED).count()
+        budget_message = "\nسقف داخلی درخواست منبع به پایان رسید؛ برای ادامه باید سقف مجاز را افزایش دهید." if budget_stops else ""
+        job.status = SearchJob.Status.FAILED if errors and not success_count and not has_results else (SearchJob.Status.PARTIAL if errors or budget_stops else SearchJob.Status.COMPLETED)
         job.total_unique_businesses = job.leads.count()
         job.total_raw_results = sum(job.source_executions.values_list("result_count", flat=True))
         job.total_errors = sum(job.source_executions.values_list("error_count", flat=True))
@@ -100,7 +127,7 @@ def run_search_job(self, job_id):
         updated = SearchJob.objects.filter(pk=job_id, status=SearchJob.Status.RUNNING).update(
             status=job.status,
             completed_at=job.completed_at,
-            error_summary=job.error_summary,
+            error_summary=job.error_summary + budget_message,
             total_raw_results=job.total_raw_results,
             total_unique_businesses=job.total_unique_businesses,
             total_errors=job.total_errors,

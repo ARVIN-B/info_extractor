@@ -23,6 +23,7 @@ class SearchJob(models.Model):
     geographic_scope_name = models.CharField("نام محدوده", max_length=120, blank=True)
     selected_sources = models.JSONField(default=list)
     max_results = models.PositiveSmallIntegerField(default=100)
+    query_expansion = models.JSONField(default=dict, blank=True)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.QUEUED)
     celery_task_id = models.CharField(max_length=255, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -63,6 +64,8 @@ class SourceExecution(models.Model):
     error_count = models.PositiveSmallIntegerField(default=0)
     query_variants = models.JSONField(default=list, blank=True)
     areas_checked = models.JSONField(default=list, blank=True)
+    checkpoint = models.JSONField(default=dict, blank=True)
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
     truncated = models.BooleanField(default=False)
     error_details = models.TextField(blank=True)
     error_type = models.CharField(max_length=40, blank=True)
@@ -115,6 +118,16 @@ class SourcePlaceDetailCache(models.Model):
         indexes = [models.Index(fields=["source_name", "expires_at"])]
 
 
+class QueryExpansionCache(models.Model):
+    cache_key = models.CharField(max_length=64, unique=True)
+    payload = models.JSONField(default=dict)
+    expires_at = models.DateTimeField(db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["expires_at"])]
+
+
 class BusinessLead(models.Model):
     class Verification(models.TextChoices):
         DISCOVERED = "discovered", "کشف‌شده"
@@ -142,7 +155,7 @@ class BusinessLead(models.Model):
     city = models.CharField(max_length=120, blank=True, db_index=True)
     province = models.CharField(max_length=120, blank=True)
     website = models.URLField(max_length=500, blank=True)
-    national_id = models.CharField(max_length=32, blank=True)
+    national_id = models.CharField(max_length=32, blank=True, db_index=True)
     business_type = models.CharField(max_length=40, blank=True)
     phone_status = models.CharField(max_length=32, choices=PhoneStatus.choices, default=PhoneStatus.NOT_CHECKED)
     confidence_score = models.FloatField(default=0.0)

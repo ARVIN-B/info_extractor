@@ -72,7 +72,10 @@ def search(request):
 def job_detail(request, job_id):
     job = owned_job(request.user, job_id)
     queue_wait_seconds = max(0, int((timezone.now() - job.created_at).total_seconds())) if job.status == SearchJob.Status.QUEUED else 0
-    resume_at = job.source_executions.filter(status=SourceExecution.Status.LONG_COOLDOWN, cooldown_until__gt=timezone.now()).order_by("cooldown_until").values_list("cooldown_until", flat=True).first()
+    resume_at = job.source_executions.filter(
+        status__in=[SourceExecution.Status.RATE_LIMITED, SourceExecution.Status.LONG_COOLDOWN],
+        cooldown_until__gt=timezone.now(),
+    ).order_by("cooldown_until").values_list("cooldown_until", flat=True).first()
     leads = job.leads.all()
     source = request.GET.get("source", "")
     city = request.GET.get("city", "").strip()[:120]
@@ -185,7 +188,8 @@ def export_json(request, job_id):
             "source": execution.source_name, "status": execution.status, "requests": execution.request_count,
             "raw_results": execution.result_count, "errors": execution.error_count,
             "message": execution.error_details, "queries": execution.query_variants,
-            "areas_checked": execution.areas_checked, "truncated": execution.truncated,
+            "areas_checked": execution.areas_checked, "checkpoint": execution.checkpoint,
+            "truncated": execution.truncated,
         } for execution in job.source_executions.all()],
     }
     response = HttpResponse(json.dumps(payload, ensure_ascii=False, indent=2), content_type="application/json; charset=utf-8")

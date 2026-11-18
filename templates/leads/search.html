@@ -9,7 +9,7 @@
       <div class="field"><label for="{{ form.geographic_scope_type.id_for_label }}">{{ form.geographic_scope_type.label }}</label>{{ form.geographic_scope_type }}{{ form.geographic_scope_type.errors }}</div>
       <div class="field" id="scope-name-field"><label for="{{ form.geographic_scope_name.id_for_label }}">{{ form.geographic_scope_name.label }}</label>{{ form.geographic_scope_name }}{{ form.geographic_scope_name.errors }}<small>برای نمونه، تهران یا استان فارس</small></div>
       <div class="field"><span class="field-label">{{ form.sources.label }}</span><div class="source-options">{{ form.sources }}</div>{{ form.sources.errors }}</div>
-      <div class="field"><label for="{{ form.max_results.id_for_label }}">{{ form.max_results.label }}</label>{{ form.max_results }}{{ form.max_results.errors }}<small>از ۱ تا ۵۰۰ سرنخ</small></div>
+      <div class="field"><label for="{{ form.max_results.id_for_label }}">{{ form.max_results.label }}</label>{{ form.max_results }}{{ form.max_results.errors }}<small>از ۱ تا {{ form.max_results.field.max_value }} سرنخ در هر جست‌وجو؛ میزان واقعی به پوشش و محدودیت منبع‌ها بستگی دارد.</small></div>
       <button class="button primary" type="submit">شروع جست‌وجو <span>←</span></button>
     </form>
     <div class="privacy-note"><span>ⓘ</span><p>شمارهٔ تلفن فقط از نظر قالب بررسی می‌شود؛ این بررسی فعال‌بودن یا مالکیت شماره را ثابت نمی‌کند.</p></div>
