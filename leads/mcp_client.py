@@ -209,6 +209,46 @@ class MCPCallResult:
     duration_ms: int
 
 
+def _plain_response_data(value, seen=None):
+    """Convert MCP/Pydantic response containers while retaining nested values."""
+    seen = seen if seen is not None else set()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    marker = id(value)
+    if marker in seen:
+        return {"__cycle_reference__": True}
+    if isinstance(value, dict):
+        seen.add(marker)
+        try:
+            return {str(key): _plain_response_data(child, seen) for key, child in value.items()}
+        finally:
+            seen.remove(marker)
+    if isinstance(value, (list, tuple)):
+        seen.add(marker)
+        try:
+            return [_plain_response_data(child, seen) for child in value]
+        finally:
+            seen.remove(marker)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            seen.add(marker)
+            return _plain_response_data(model_dump(mode="json"), seen)
+        except Exception:
+            pass
+        finally:
+            seen.discard(marker)
+    if hasattr(value, "__dict__"):
+        try:
+            seen.add(marker)
+            return {str(key): _plain_response_data(child, seen) for key, child in vars(value).items() if not key.startswith("_")}
+        except (TypeError, AttributeError):
+            pass
+        finally:
+            seen.discard(marker)
+    return str(value)
+
+
 def decode_result(result):
     is_error = getattr(result, "isError", None)
     if is_error is None:
@@ -222,7 +262,7 @@ def decode_result(result):
     if structured is None:
         structured = getattr(result, "structured_content", None)
     if structured is not None:
-        return structured
+        structured = _plain_response_data(structured)
     values = []
     for item in getattr(result, "content", []):
         if getattr(item, "type", "") == "text":
@@ -230,7 +270,14 @@ def decode_result(result):
                 values.append(json.loads(item.text))
             except (TypeError, json.JSONDecodeError):
                 values.append(item.text)
-    return values[0] if len(values) == 1 else values
+    text_data = _plain_response_data(values[0] if len(values) == 1 else values)
+    if structured is not None:
+        # Keep all MCP representations. Some servers provide summary fields in
+        # structuredContent and additional public fields in text content.
+        if values:
+            return {"_mcp_structured_content": structured, "_mcp_text_content": text_data}
+        return structured
+    return text_data
 
 
 @asynccontextmanager

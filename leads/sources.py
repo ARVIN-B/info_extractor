@@ -14,7 +14,7 @@ from django.db import transaction
 from django.utils import timezone
 from redis import Redis
 
-from .adapters import SOURCE_ADAPTERS
+from .adapters import SOURCE_ADAPTERS, _records as _adapter_records
 from .mcp_client import MCPBudgetExhausted, MCPSourceError, SOURCE_REGISTRY, source_session
 from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
 from .normalization import extract_iranian_mobiles, has_iranian_mobile, normalize_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
@@ -155,15 +155,7 @@ def _is_repeated_catalog_page(fingerprint, history, current_page):
 
 
 def _records(data):
-    if isinstance(data, dict):
-        for key in ("results", "places", "businesses", "items", "shops", "vendors", "companies", "offers", "products"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-        return [data] if any(key in data for key in ("id", "place_id", "shop_id", "company_id", "name", "title")) else []
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    return []
+    return _adapter_records(data)
 
 
 def _first(data, *keys):
@@ -186,16 +178,27 @@ def _field_values(search_record, detail):
     detail_raw = detail
     detail = detail if isinstance(detail, dict) else {}
     search_raw = search_record.get("_source_raw", search_record) if isinstance(search_record, dict) else search_record
-    mobile_candidates = [
-        *extract_iranian_mobiles(
-            search_raw, path="search", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
+    extraction_payload = search_record.get("_phone_extraction_payload") if isinstance(search_record, dict) else None
+    extraction_diagnostics = {}
+    if extraction_payload is not None:
+        mobile_candidates = extract_iranian_mobiles(
+            extraction_payload, path="source", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
             max_nodes=settings.PHONE_EXTRACTION_MAX_NODES, max_text_chars=settings.PHONE_EXTRACTION_MAX_STRING_CHARS,
-        ),
-        *extract_iranian_mobiles(
-            detail_raw, path="detail", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
-            max_nodes=settings.PHONE_EXTRACTION_MAX_NODES, max_text_chars=settings.PHONE_EXTRACTION_MAX_STRING_CHARS,
-        ),
-    ]
+            diagnostics=extraction_diagnostics,
+        )
+    else:
+        mobile_candidates = [
+            *extract_iranian_mobiles(
+                search_raw, path="search", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
+                max_nodes=settings.PHONE_EXTRACTION_MAX_NODES, max_text_chars=settings.PHONE_EXTRACTION_MAX_STRING_CHARS,
+                diagnostics=extraction_diagnostics,
+            ),
+            *extract_iranian_mobiles(
+                detail_raw, path="detail", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
+                max_nodes=settings.PHONE_EXTRACTION_MAX_NODES, max_text_chars=settings.PHONE_EXTRACTION_MAX_STRING_CHARS,
+                diagnostics=extraction_diagnostics,
+            ),
+        ]
     name = _first(detail, "name", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "title") or _first(search_record, "name", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "title", "maintext")
     address = _first(detail, "address", "formatted_address") or _first(search_record, "address", "subtext1")
     # A generic `url` on map records points to the provider's place page, not
@@ -226,6 +229,7 @@ def _field_values(search_record, detail):
         "address": str(address or "").strip(),
         "phones": phones,
         "mobile_candidates": mobile_candidates,
+        "extraction_diagnostics": extraction_diagnostics,
         "emails": emails,
         "social_urls": socials,
         "website": str(website or "").strip(),
@@ -248,30 +252,95 @@ def _source_url(source, record_id):
     return ""
 
 
+def _add_source_diagnostics(job, source, increments):
+    execution = SourceExecution.objects.filter(search_job=job, source_name=source).first()
+    if not execution:
+        return
+    diagnostics = dict(execution.diagnostics or {})
+    for name, amount in increments.items():
+        diagnostics[name] = int(diagnostics.get(name, 0) or 0) + int(amount or 0)
+    execution.diagnostics = diagnostics
+    execution.save(update_fields=["diagnostics"])
+
+
+def _add_variant_yield(job, source, variant, *, businesses=0, mobile_rows=0):
+    if not variant:
+        return
+    execution = SourceExecution.objects.filter(search_job=job, source_name=source).first()
+    if not execution:
+        return
+    diagnostics = dict(execution.diagnostics or {})
+    yields = dict(diagnostics.get("query_variant_yield", {}))
+    item = dict(yields.get(str(variant)[:200], {}))
+    item["unique_businesses_discovered"] = int(item.get("unique_businesses_discovered", 0) or 0) + int(bool(businesses))
+    item["mobile_rows_created"] = int(item.get("mobile_rows_created", 0) or 0) + int(mobile_rows or 0)
+    yields[str(variant)[:200]] = item
+    diagnostics["query_variant_yield"] = yields
+    diagnostics["query_variants_measured"] = len(yields)
+    diagnostics["variant_businesses_discovered"] = int(diagnostics.get("variant_businesses_discovered", 0) or 0) + int(bool(businesses))
+    diagnostics["variant_mobile_rows_created"] = int(diagnostics.get("variant_mobile_rows_created", 0) or 0) + int(mobile_rows or 0)
+    execution.diagnostics = diagnostics
+    execution.save(update_fields=["diagnostics"])
+
+
+def _record_tool_diagnostics(execution_id, source, tool_name, data):
+    config = SOURCE_REGISTRY[source]
+    role = next((name for name, value in config["tools"].items() if value == tool_name), "other")
+    rows = _records(data)
+    fields = {
+        "mcp_responses_received": 1,
+        "raw_response_payloads_received": 1,
+    }
+    if role in {"search", "nearby"}:
+        fields.update(search_responses_received=1, search_records_received=len(rows))
+    elif role in {"detail", "offers", "shops"}:
+        fields.update(detail_responses_received=1, detail_records_received=len(rows))
+    else:
+        fields.update(other_responses_received=1, other_records_received=len(rows))
+    execution = SourceExecution.objects.get(pk=execution_id)
+    diagnostics = dict(execution.diagnostics or {})
+    for name, amount in fields.items():
+        diagnostics[name] = int(diagnostics.get(name, 0) or 0) + amount
+    execution.diagnostics = diagnostics
+    execution.save(update_fields=["diagnostics"])
+
+
 def _safe_source_response(value):
     """Retain unknown source fields within configured structural and byte limits."""
     limits = {"nodes": 0}
+    private_keys = {"user", "customer", "buyer", "account", "owner", "personal_profile", "user_profile"}
+    public_keys = {"public_contact", "business_contact", "contact_info", "public_profile"}
 
-    def convert(item, depth=0):
+    def convert(item, depth=0, private_context=False):
         limits["nodes"] += 1
         if depth > settings.PHONE_EXTRACTION_MAX_DEPTH or limits["nodes"] > settings.PHONE_EXTRACTION_MAX_NODES:
             return {"__truncated__": True}
         if isinstance(item, dict):
-            return {str(key)[:200]: convert(child, depth + 1) for key, child in list(item.items())[:1000]}
+            result = {}
+            for key, child in list(item.items())[:1000]:
+                key_text = str(key)[:200]
+                normalized_key = re.sub(r"[^a-z0-9]+", "_", key_text.casefold()).strip("_")
+                child_private = False if normalized_key in public_keys else (private_context or normalized_key in private_keys)
+                result[key_text] = convert(child, depth + 1, child_private)
+            return result
         if isinstance(item, (list, tuple)):
-            return [convert(child, depth + 1) for child in item[:1000]]
+            return [convert(child, depth + 1, private_context) for child in item[:1000]]
         if isinstance(item, str):
+            if private_context:
+                return "[redacted private profile value]"
             return item[:settings.PHONE_EXTRACTION_MAX_STRING_CHARS]
         if isinstance(item, (int, float, bool)) or item is None:
+            if private_context:
+                return "[redacted private profile value]"
             return item
         model_dump = getattr(item, "model_dump", None)
         if callable(model_dump):
             try:
-                return convert(model_dump(mode="json"), depth + 1)
+                return convert(model_dump(mode="json"), depth + 1, private_context)
             except Exception:
                 pass
         try:
-            return convert(vars(item), depth + 1)
+            return convert(vars(item), depth + 1, private_context)
         except (TypeError, AttributeError):
             return str(item)[:settings.PHONE_EXTRACTION_MAX_STRING_CHARS]
 
@@ -364,6 +433,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
         return None
     record_id = str(record_id)
     fields = _field_values(search_record, detail)
+    extraction_stats = fields["extraction_diagnostics"]
     if not fields["name"]:
         return None
     website, _ = normalize_website(fields["website"])
@@ -379,6 +449,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
     invalid_phone_values = [str(phone).strip() for phone in phone_inputs if str(phone).strip() and not phone_is_valid(phone)]
     all_phone_values = valid_phones
     lead = _find_match(job, source, record_id, fields)
+    is_new_business = lead is None
     was_mobile = bool(lead and (lead.has_mobile_phone or has_iranian_mobile(lead.phone_numbers)))
     source_ids = dict(lead.source_record_ids) if lead else {}
     source_ids[source] = record_id
@@ -447,12 +518,12 @@ def save_lead(job, source, search_record, detail, return_created=False):
     lead.confidence_score = calculate_confidence(lead)
     lead.save(update_fields=["confidence_score"])
     retention_days = settings.SOURCE_RAW_RESPONSE_RETENTION_DAYS
-    raw = _safe_source_response({
-        "search": search_record.get("_source_raw", search_record) if isinstance(search_record, dict) else search_record,
-        "details": detail,
-    }) if retention_days else {}
+    raw = _safe_source_response({"search_record": search_record, "detail_response": detail}) if retention_days else {}
     raw_expires_at = timezone.now() + timedelta(days=retention_days) if retention_days else None
     source_url = fields["profile_url"] or _source_url(source, record_id)
+    newly_persisted = 0
+    already_persisted = 0
+    suppressed_count = 0
     for candidate in fields["mobile_candidates"]:
         normalized = normalize_iranian_mobile(candidate.raw_value)
         if not normalized:
@@ -465,10 +536,15 @@ def save_lead(job, source, search_record, detail, return_created=False):
             business_lead=lead, normalized_number=normalized,
             defaults={"permission_status": permission},
         )
+        if _:
+            newly_persisted += 1
+        else:
+            already_persisted += 1
         if phone.last_seen_at < timezone.now():
             phone.last_seen_at = timezone.now()
             phone.save(update_fields=["last_seen_at"])
         if SuppressedPhone.objects.filter(normalized_number=normalized).exists():
+            suppressed_count += 1
             phone.permission_status = BusinessPhone.PermissionStatus.SUPPRESSED
             phone.save(update_fields=["permission_status"])
         elif candidate.contact_context and phone.permission_status == BusinessPhone.PermissionStatus.UNKNOWN:
@@ -489,6 +565,36 @@ def save_lead(job, source, search_record, detail, return_created=False):
                 "business_match_status": match_status,
             },
         )
+    _add_source_diagnostics(job, source, {
+        "business_records_inspected": 1,
+        "extractor_nodes_traversed": extraction_stats.get("nodes_traversed", 0),
+        "strings_inspected": extraction_stats.get("strings_inspected", 0),
+        "phone_like_candidates": extraction_stats.get("phone_like_patterns", 0),
+        "identifier_filtered_candidates": extraction_stats.get("identifier_filtered_candidates", 0),
+        "private_account_candidates_filtered": extraction_stats.get("private_account_candidates_filtered", 0),
+        "normalization_rejected_candidates": extraction_stats.get("normalization_rejected", 0),
+        "valid_mobile_candidates": len(fields["mobile_candidates"]),
+        "persisted_mobile_rows_created": newly_persisted,
+        "mobile_rows_already_present": already_persisted,
+        "suppressed_mobile_candidates": suppressed_count,
+        "records_without_valid_mobile": int(not valid_phones),
+        "raw_response_truncated_records": int(bool(raw.get("__truncated__"))) if isinstance(raw, dict) else 0,
+    })
+    _add_variant_yield(
+        job, source, search_record.get("_query_variant"),
+        businesses=is_new_business, mobile_rows=newly_persisted,
+    )
+    source_execution = SourceExecution.objects.filter(search_job=job, source_name=source).first()
+    if source_execution:
+        diagnostics = dict(source_execution.diagnostics or {})
+        diagnostics["unique_normalized_mobiles"] = BusinessPhoneEvidence.objects.filter(
+            source_name=source, business_phone__business_lead__search_job=job,
+        ).values("business_phone__normalized_number").distinct().count()
+        diagnostics["businesses_with_mobile"] = BusinessPhoneEvidence.objects.filter(
+            source_name=source, business_phone__business_lead__search_job=job,
+        ).values("business_phone__business_lead_id").distinct().count()
+        source_execution.diagnostics = diagnostics
+        source_execution.save(update_fields=["diagnostics"])
     values = {
         "name": fields["name"], "address": fields["address"], "phone_numbers": phone_evidence_values,
         "website": fields["website"], "category": fields["category"], "latitude": fields["lat"], "longitude": fields["lng"],
@@ -699,6 +805,7 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
                 resume_offset = record_index
                 break
             record = dict(record)
+            record["_query_variant"] = variant
             stable_id = str(record.get("_source_id") or _first(record, "id", "place_id", "token", "shop_id", "seller_id", "seller_code", "vendor_id", "company_id", "national_id") or "")
             if stable_id and stable_id in processed_ids:
                 continue
@@ -716,6 +823,7 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
             if record.get("_source_id"):
                 record.setdefault("id", record["_source_id"])
             lead, newly_qualified = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail, return_created=True)
+            await sync_to_async(execution.refresh_from_db, thread_sensitive=True)(fields=["diagnostics"])
             if lead and newly_qualified:
                 saved += 1
         execution.result_count += len(candidates)
@@ -886,6 +994,8 @@ async def _search_source(source, job, execution):
             source_execution=execution, tool_name=tool_name, duration_ms=result.duration_ms,
             result_count=len(_records(result.data)),
         )
+        await sync_to_async(_record_tool_diagnostics, thread_sensitive=True)(execution.pk, source, tool_name, result.data)
+        await sync_to_async(execution.refresh_from_db, thread_sensitive=True)(fields=["diagnostics"])
         cancelled = await sync_to_async(
             lambda: SearchJob.objects.filter(pk=job.pk, status=SearchJob.Status.CANCELLED).exists(),
             thread_sensitive=True,
@@ -991,8 +1101,16 @@ async def _search_source(source, job, execution):
                             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count", "error_count", "error_details"])
                     execution.request_count = initial_request_count + client.request_count
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["request_count"])
+                    raw_search_record = dict(record)
+                    record["_source_raw"] = {
+                        "search_response": result.data, "search_record": raw_search_record,
+                        "detail_response": detail_data,
+                    }
+                    record["_phone_extraction_payload"] = {"search_record": raw_search_record, "detail": detail_data}
                     record["_searched_city"] = place_name
+                    record["_query_variant"] = variant
                     lead, newly_qualified = await sync_to_async(save_lead, thread_sensitive=True)(job, source, record, detail_data, return_created=True)
+                    await sync_to_async(execution.refresh_from_db, thread_sensitive=True)(fields=["diagnostics"])
                     if lead and newly_qualified:
                         saved += 1
                         location_saved += 1

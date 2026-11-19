@@ -19,7 +19,7 @@ from django.utils import timezone
 from mcp.types import TextContent
 from openpyxl import load_workbook
 
-from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, QueraCompanyAdapter, RasmioAdapter, SnappShopAdapter, TorobShopAdapter, _arguments
+from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, MarketplaceProductAdapter, QueraCompanyAdapter, RasmioAdapter, SnappShopAdapter, TorobShopAdapter, _arguments, _records as adapter_records, _seller_scoped_payload
 from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, SOURCE_REGISTRY, decode_result
 from .forms import SearchJobForm
 from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, LeadEvidence, QueryExpansionCache, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
@@ -68,6 +68,107 @@ class NormalizationTests(TestCase):
         candidates = extract_iranian_mobiles(payload, max_depth=8, max_nodes=30)
         self.assertEqual([item.normalized_number for item in candidates], ["+989123456789"])
         self.assertEqual(extract_iranian_mobiles("1234567890123456789012345678909123456789"), [])
+
+    def test_identifier_named_container_is_traversed_but_identifier_leaf_is_filtered(self):
+        payload = {
+            "customer_identity": {"public_contact": {"phone": "09123456789"}},
+            "postal_code": "09123456789",
+            "valid": "Call 09123456789",
+        }
+        candidates = extract_iranian_mobiles(payload)
+        self.assertEqual({item.normalized_number for item in candidates}, {"+989123456789"})
+        self.assertTrue(any("customer_identity.public_contact.phone" in item.field_path for item in candidates))
+
+    def test_phone_extractor_handles_pydantic_style_objects(self):
+        payload = SimpleNamespace(profile=SimpleNamespace(public_contact={"primary_number": "+989123456789"}))
+        candidates = extract_iranian_mobiles(payload)
+        self.assertEqual([item.normalized_number for item in candidates], ["+989123456789"])
+
+    def test_private_account_phone_is_filtered_while_public_business_contact_is_kept(self):
+        diagnostics = {}
+        payload = {
+            "seller": {"user": {"phone": "09123456780"}},
+            "public_contact": {"phone": "09123456789"},
+        }
+        candidates = extract_iranian_mobiles(payload, diagnostics=diagnostics)
+        self.assertEqual({item.normalized_number for item in candidates}, {"+989123456789"})
+        self.assertEqual(diagnostics["private_account_candidates_filtered"], 1)
+
+
+class MCPResponsePipelineTests(TestCase):
+    def test_mcp_decoder_preserves_structured_and_text_content(self):
+        response = SimpleNamespace(
+            isError=False,
+            structuredContent={"results": [{"id": "shop-1", "name": "Shop"}]},
+            content=[SimpleNamespace(type="text", text='{"extra_contact":{"phone":"09123456789"}}')],
+        )
+        decoded = decode_result(response)
+        self.assertIn("_mcp_structured_content", decoded)
+        self.assertIn("_mcp_text_content", decoded)
+        self.assertEqual(decoded["_mcp_structured_content"]["results"][0]["id"], "shop-1")
+        self.assertEqual(decoded["_mcp_text_content"]["extra_contact"]["phone"], "09123456789")
+
+    def test_record_parser_merges_text_fields_and_additional_records(self):
+        payload = {
+            "_mcp_structured_content": {"results": [{"id": "a", "name": "Shop A", "status": "active"}]},
+            "_mcp_text_content": {"results": [
+                {"id": "a", "name": "Shop A", "public_contact": {"mobile": "09123456789"}},
+                {"id": "b", "name": "Shop B", "public_contact": {"mobile": "09123456780"}},
+            ]},
+        }
+        rows = adapter_records(payload)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["status"], "active")
+        self.assertEqual(rows[0]["public_contact"]["mobile"], "09123456789")
+        self.assertEqual(rows[1]["id"], "b")
+
+    def test_marketplace_preserves_complete_detail_and_scopes_phone_to_each_seller(self):
+        adapter = MarketplaceProductAdapter()
+        adapter.source_id = "digikala"
+        query_schema = {"type": "object", "properties": {"query": {"type": "string"}, "page": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["query"]}
+        detail_schema = {"type": "object", "properties": {"product_id": {"type": "integer"}}, "required": ["product_id"]}
+        client = SimpleNamespace(tools={"dk_search": SimpleNamespace(input_schema=query_schema), "dk_product": SimpleNamespace(input_schema=detail_schema)})
+        search_response = {"products": [{"id": 101, "name": "Example product", "search_metadata": {"page": 1}}], "pagination": {"total": 1}}
+        detail_response = {
+            "product": {"id": 101, "title": "Example product"},
+            "offers": [
+                {"seller_id": "seller-a", "seller_name": "Public Shop A", "public_contact": {"mobile": "09123456789"}},
+                {"seller_id": "seller-b", "seller_name": "Public Shop B", "public_contact": {"mobile": "09123456780"}},
+            ],
+            "detail_metadata": {"offers_total": 2},
+        }
+
+        async def invoke(_client, tool_name, arguments):
+            if tool_name == "dk_search":
+                return MCPCallResult(search_response, 10)
+            return MCPCallResult(detail_response, 12)
+
+        result = asyncio.run(adapter.discover(client, invoke, "test", "", "", 2))
+        self.assertEqual(len(result.records), 2)
+        for row, _detail in result.records:
+            self.assertEqual(row["_source_raw"]["search_response"], search_response)
+            self.assertEqual(row["_source_raw"]["product_detail_response"], detail_response)
+            candidates = extract_iranian_mobiles(row["_phone_extraction_payload"])
+            expected = "+989123456789" if row["_source_id"] == "seller-a" else "+989123456780"
+            self.assertEqual({item.normalized_number for item in candidates}, {expected})
+
+    def test_seller_scoping_requires_matching_seller_identifier(self):
+        payload = {"sellers": [
+            {"seller_id": "a", "public_contact": {"phone": "09123456789"}},
+            {"seller_id": "b", "public_contact": {"phone": "09123456780"}},
+        ]}
+        selected = _seller_scoped_payload([payload], "a")
+        self.assertEqual(len(selected), 1)
+        self.assertEqual({item.normalized_number for item in extract_iranian_mobiles(selected)}, {"+989123456789"})
+
+    def test_raw_payload_redacts_private_account_values_but_keeps_public_contact_shape(self):
+        payload = _safe_source_response({
+            "user": {"name": "Private User", "phone": "09123456780"},
+            "public_contact": {"phone": "09123456789"},
+        })
+        self.assertEqual(payload["user"]["phone"], "[redacted private profile value]")
+        self.assertEqual(payload["user"]["name"], "[redacted private profile value]")
+        self.assertEqual(payload["public_contact"]["phone"], "09123456789")
 
     def test_website_normalization(self):
         self.assertEqual(normalize_website("http://www.Example.com/")[1], "example.com")
@@ -301,6 +402,17 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(self.job.leads.count(), 1)
         self.assertEqual(self.job.leads.get().source_record_ids["neshan"], search["id"])
         self.assertEqual(LeadEvidence.objects.filter(business_lead__search_job=self.job, field_name="raw_response").count(), 1)
+
+    def test_query_variant_diagnostics_count_unique_businesses_and_added_mobile_rows(self):
+        SourceExecution.objects.create(search_job=self.job, source_name="neshan")
+        record = {"id": "c" * 32, "name": "Example shop", "phone": "09123456789", "_query_variant": "restaurant"}
+        save_lead(self.job, "neshan", record, {})
+        save_lead(self.job, "neshan", record, {})
+        diagnostics = SourceExecution.objects.get(search_job=self.job, source_name="neshan").diagnostics
+        self.assertEqual(diagnostics["query_variants_measured"], 1)
+        self.assertEqual(diagnostics["variant_businesses_discovered"], 1)
+        self.assertEqual(diagnostics["query_variant_yield"]["restaurant"]["unique_businesses_discovered"], 1)
+        self.assertEqual(diagnostics["query_variant_yield"]["restaurant"]["mobile_rows_created"], 1)
 
     def test_mobile_discovery_promotes_existing_candidate_to_one_success(self):
         record = {"id": "b" * 32, "name": "مغازه نمونه", "phone": "02112345678", "address": "تهران"}
@@ -1251,12 +1363,16 @@ class JobAndExportTests(TestCase):
 
     def test_json_export_uses_database_and_contains_provenance(self):
         self.client.force_login(self.user)
+        self.executions[0].diagnostics = {"search_records_received": 2, "valid_mobile_candidates": 1}
+        self.executions[0].save(update_fields=["diagnostics"])
         response = self.client.get(reverse("export_json", args=[self.job.pk]))
         payload = json.loads(response.content)
         self.assertEqual(payload["results"][0]["name"], self.lead.original_name)
         self.assertEqual(payload["results"][0]["emails"], ["public@example.ir"])
         self.assertEqual(payload["results"][0]["confidence_score"], 0.8)
         self.assertEqual(payload["results"][0]["evidence"][0]["source"], "neshan")
+        neshan_export = next(item for item in payload["sources"] if item["source"] == "neshan")
+        self.assertEqual(neshan_export["diagnostics"]["search_records_received"], 2)
 
     def test_marketing_export_requires_explicit_permission_and_excludes_suppressed_numbers(self):
         self.client.force_login(self.user)

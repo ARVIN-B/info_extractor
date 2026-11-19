@@ -60,33 +60,55 @@ def phone_is_valid(value):
 
 
 def _is_identifier_key(key):
-    key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
-    return any(term in key for term in (
-        "id", "identifier", "postal", "postcode", "zipcode", "tracking", "ordercode",
-        "productcode", "nationalcode", "nationalid", "latitude", "longitude",
-    ))
+    key = re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
+    exact = {
+        "id", "identifier", "uuid", "postal", "postal_code", "postcode", "zip", "zipcode",
+        "tracking", "tracking_code", "order", "order_id", "order_code", "product_id",
+        "product_code", "national_code", "national_id", "latitude", "longitude", "lat", "lng",
+        "registration_id", "company_id", "seller_id", "shop_id", "vendor_id", "merchant_id",
+    }
+    return key in exact or key.endswith(("_id", "_uuid", "_postal_code", "_postcode", "_zipcode", "_tracking_code", "_order_code", "_product_code", "_national_code"))
 
 
 def _has_contact_context(path):
     return bool(re.search(r"phone|mobile|tel|contact|تماس|تلفن|موبایل|همراه", path, re.IGNORECASE))
 
 
-def extract_iranian_mobiles(value, *, path="", max_depth=12, max_nodes=10000, max_text_chars=20000):
+
+def _is_private_account_contact(path):
+    parts = [re.sub(r"\[\d+\]$", "", part).casefold() for part in re.split(r"[.\[\]]+", path) if part]
+    if any(part in {"public_contact", "business_contact", "contact_info", "public_profile"} for part in parts):
+        return False
+    return any(part in {"user", "customer", "buyer", "account", "owner", "personal_profile", "user_profile"} for part in parts)
+
+def extract_iranian_mobiles(value, *, path="", max_depth=12, max_nodes=10000, max_text_chars=20000, diagnostics=None):
     """Recursively extract bounded, deduplicated Iranian mobile candidates from source data."""
     candidates = []
     seen_objects = set()
     visited_nodes = 0
     seen_values = set()
+    metrics = diagnostics if diagnostics is not None else {}
+    for key in ("nodes_traversed", "strings_inspected", "phone_like_patterns", "identifier_filtered_candidates", "private_account_candidates_filtered", "normalization_rejected", "valid_mobiles"):
+        metrics.setdefault(key, 0)
 
     def visit(item, current_path, depth, parent_key=""):
         nonlocal visited_nodes
         if depth > max_depth or visited_nodes >= max_nodes:
             return
         visited_nodes += 1
-        if _is_identifier_key(parent_key):
+        metrics["nodes_traversed"] += 1
+        is_container = isinstance(item, (Mapping, list, tuple))
+        if _is_identifier_key(parent_key) and not is_container:
+            if isinstance(item, str):
+                sample = item[:max_text_chars].translate(NUMBER_TRANSLATION)
+                metrics["identifier_filtered_candidates"] += len(list(_MOBILE_PATTERN.finditer(sample)))
             return
         if isinstance(item, str):
+            metrics["strings_inspected"] += 1
             text = item[:max_text_chars].translate(NUMBER_TRANSLATION)
+            if _is_private_account_contact(current_path):
+                metrics["private_account_candidates_filtered"] += len(list(_MOBILE_PATTERN.finditer(text)))
+                return
             stripped = text.lstrip()
             if stripped.startswith(("{", "[")) and len(text) <= max_text_chars:
                 try:
@@ -96,13 +118,18 @@ def extract_iranian_mobiles(value, *, path="", max_depth=12, max_nodes=10000, ma
                 if isinstance(parsed, (dict, list)):
                     visit(parsed, current_path, depth + 1)
                     return
-            for match in _MOBILE_PATTERN.finditer(text):
+            matches = list(_MOBILE_PATTERN.finditer(text))
+            metrics["phone_like_patterns"] += len(matches)
+            for match in matches:
                 raw = match.group("number")
                 normalized = normalize_iranian_mobile(raw)
                 key = (normalized, current_path, raw)
-                if normalized and key not in seen_values:
+                if not normalized:
+                    metrics["normalization_rejected"] += 1
+                elif key not in seen_values:
                     seen_values.add(key)
                     candidates.append(MobileCandidate(raw, normalized, current_path or "$", _has_contact_context(current_path)))
+                    metrics["valid_mobiles"] += 1
             return
         if item is None or isinstance(item, (bool, float)):
             return

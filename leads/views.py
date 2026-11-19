@@ -264,7 +264,7 @@ def export_json(request, job_id):
             "raw_results": execution.result_count, "errors": execution.error_count,
             "message": execution.error_details, "queries": execution.query_variants,
             "areas_checked": execution.areas_checked, "checkpoint": execution.checkpoint,
-            "truncated": execution.truncated,
+            "truncated": execution.truncated, "diagnostics": execution.diagnostics,
         } for execution in job.source_executions.all()],
     }
     response = HttpResponse(json.dumps(payload, ensure_ascii=False, indent=2), content_type="application/json; charset=utf-8")

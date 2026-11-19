@@ -67,6 +67,7 @@ class SourceExecution(models.Model):
     query_variants = models.JSONField(default=list, blank=True)
     areas_checked = models.JSONField(default=list, blank=True)
     checkpoint = models.JSONField(default=dict, blank=True)
+    diagnostics = models.JSONField(default=dict, blank=True)
     last_attempt_at = models.DateTimeField(null=True, blank=True)
     truncated = models.BooleanField(default=False)
     error_details = models.TextField(blank=True)

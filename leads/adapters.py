@@ -1,6 +1,7 @@
 """Small, deterministic source adapters. Tool schemas remain the runtime source of truth."""
 
 import math
+import re
 from dataclasses import dataclass
 from django.conf import settings
 
@@ -32,13 +33,86 @@ def _records(data):
         except (TypeError, json.JSONDecodeError):
             return []
     if isinstance(data, dict):
+        if "_mcp_structured_content" in data:
+            structured_rows = _records(data["_mcp_structured_content"])
+            text_rows = _records(data.get("_mcp_text_content"))
+            merged = list(structured_rows)
+            for text_row in text_rows:
+                identity = _record_identity(text_row)
+                match_index = next((index for index, row in enumerate(merged)
+                                    if identity and _record_identity(row) == identity), None)
+                if match_index is None:
+                    if text_row not in merged:
+                        merged.append(text_row)
+                else:
+                    merged[match_index] = _merge_record(merged[match_index], text_row)
+            return merged
         for key in ("results", "places", "businesses", "items", "shops", "vendors", "companies", "offers", "products"):
             if isinstance(data.get(key), list):
                 return [row for row in data[key] if isinstance(row, dict)]
+        for key in ("data", "result", "response"):
+            if isinstance(data.get(key), (dict, list, str)):
+                nested = _records(data[key])
+                if nested:
+                    return nested
         return [data] if any(key in data for key in ("id", "shop_id", "company_id", "name", "title")) else []
     if isinstance(data, list):
         return [row for row in data if isinstance(row, dict)]
     return []
+
+
+def _record_identity(row):
+    for key in ("id", "place_id", "shop_id", "seller_id", "vendor_id", "company_id", "slug", "uuid"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return key, str(value)
+    name = _first(row, "name", "title", "company_name", "shop_name")
+    return ("name", str(name).casefold()) if name else None
+
+
+def _merge_record(left, right):
+    merged = dict(left)
+    for key, value in right.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _merge_record(merged[key], value)
+        elif isinstance(merged.get(key), list) and isinstance(value, list):
+            combined = list(merged[key])
+            combined.extend(item for item in value if item not in combined)
+            merged[key] = combined
+        elif value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def _seller_scoped_payload(payloads, seller_id):
+    """Return only seller objects that explicitly carry this seller's ID."""
+    wanted = str(seller_id)
+    identity_keys = {"seller_id", "seller_code", "shop_id", "shopid", "vendor_id", "vendorid", "merchant_id", "merchantid"}
+    matches = []
+    seen = set()
+
+    def visit(value, parent_key=""):
+        if isinstance(value, dict):
+            values = {str(key).casefold().replace("-", "_"): str(item) for key, item in value.items()
+                      if key.casefold().replace("-", "_") in identity_keys and item is not None}
+            if re.fullmatch(r"(?:seller|shop|vendor|merchant|seller_profile|shop_profile|vendor_profile)", parent_key.casefold().replace("-", "_")):
+                if value.get("id") is not None:
+                    values["id"] = str(value["id"])
+            if wanted in values.values():
+                marker = id(value)
+                if marker not in seen:
+                    seen.add(marker)
+                    matches.append(value)
+                return
+            for key, child in value.items():
+                visit(child, str(key))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child, parent_key)
+
+    for payload in payloads:
+        visit(payload)
+    return matches
 
 
 def _arguments(client, tool_name, values):
@@ -124,14 +198,16 @@ class EmallsAdapter(SourceAdapter):
         try:
             end_page = min(max_pages, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
             for page in range(start_page, end_page + 1):
-                products = _records((await invoke(client, search_name, self._search_args(client, query, city, province, page_size, page=page))).data)
+                search_response = (await invoke(client, search_name, self._search_args(client, query, city, province, page_size, page=page))).data
+                products = _records(search_response)
                 for product in products:
                     product_id = _first(product, "id", "product_id", "productId")
                     if not product_id:
                         continue
                     offers_name = tools(client, self.source_id, "offers")
                     offers_args = _arguments(client, offers_name, {"product_id": str(product_id), "city": city})
-                    offers = _records((await invoke(client, offers_name, offers_args)).data)
+                    offers_response = (await invoke(client, offers_name, offers_args)).data
+                    offers = _records(offers_response)
                     for offer in offers:
                         shop_id = _first(offer, "shop_id", "shopId", "id")
                         if not shop_id or str(shop_id) in seen_shops:
@@ -145,7 +221,14 @@ class EmallsAdapter(SourceAdapter):
                         record["_source_id"] = str(shop_id)
                         record["_source_city"] = _first(profile if isinstance(profile, dict) else {}, "city") or _first(offer, "city") or city
                         record["_source_province"] = _first(profile if isinstance(profile, dict) else {}, "province") or _first(offer, "province") or province
-                        record["_source_raw"] = {"product": product, "offer": offer}
+                        profile_payload = profile if isinstance(profile, (dict, list)) else {"value": profile}
+                        scoped = [offer, *_seller_scoped_payload([product, profile_payload], shop_id)]
+                        record["_source_raw"] = {
+                            "search_response": search_response, "product": product,
+                            "offers_response": offers_response, "seller_offer": offer,
+                            "seller_profile_response": profile_payload,
+                        }
+                        record["_phone_extraction_payload"] = {"seller": scoped}
                         found.append((record, profile))
                         if len(found) >= limit:
                             return AdapterResult(found, True)
@@ -176,7 +259,8 @@ class BasalamAdapter(SourceAdapter):
         try:
             end_page = min(max_pages, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
             for page in range(start_page, end_page + 1):
-                products = _records((await invoke(client, search_name, self._search_args(client, query, city, province, page_size, page=page))).data)
+                search_response = (await invoke(client, search_name, self._search_args(client, query, city, province, page_size, page=page))).data
+                products = _records(search_response)
                 for product in products:
                     shop_id = _first(product, "shop_id", "vendor_id", "vendorId")
                     if not shop_id or str(shop_id) in seen_shops:
@@ -189,7 +273,13 @@ class BasalamAdapter(SourceAdapter):
                     record["name"] = _first(profile if isinstance(profile, dict) else {}, "name", "vendor_name", "title") or _first(product, "shop_name", "vendor_name")
                     record["_source_city"] = _first(profile if isinstance(profile, dict) else {}, "city")
                     record["_source_province"] = _first(profile if isinstance(profile, dict) else {}, "province")
-                    record["_source_raw"] = {"product": product}
+                    profile_payload = profile if isinstance(profile, (dict, list)) else {"value": profile}
+                    scoped = [product, *_seller_scoped_payload([profile_payload], shop_id)]
+                    record["_source_raw"] = {
+                        "search_response": search_response, "product": product,
+                        "vendor_profile_response": profile_payload,
+                    }
+                    record["_phone_extraction_payload"] = {"seller": scoped}
                     found.append((record, profile))
                     if len(found) >= limit:
                         return AdapterResult(found, True)
@@ -220,7 +310,8 @@ class RasmioAdapter(SourceAdapter):
             end_page = min(max_pages, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
             for page in range(start_page, end_page + 1):
                 args = _arguments(client, search_name, {"query": query, "city": city, "province": province, "page": page, "limit": page_size})
-                rows = _records((await invoke(client, search_name, args)).data)
+                search_response = (await invoke(client, search_name, args)).data
+                rows = _records(search_response)
                 for row in rows:
                     company_id = _first(row, "company_id", "national_id", "nationalId", "id")
                     if not company_id:
@@ -231,6 +322,8 @@ class RasmioAdapter(SourceAdapter):
                     record["name"] = _first(row, "name", "company_name", "title")
                     record["_source_city"] = _first(row, "city") or city
                     record["_source_province"] = _first(row, "province") or province
+                    record["_source_raw"] = {"search_response": search_response, "company_record": row}
+                    record["_phone_extraction_payload"] = {"company": row}
                     found.append((record, {}))
                     if len(found) >= limit:
                         return AdapterResult(found, True)
@@ -278,7 +371,8 @@ class TorobShopAdapter(SourceAdapter):
         end_page = min(page_count - 1, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
         for page in range(start_page, end_page + 1):
             args = _arguments(client, tool, {"query": query, "city": city or province or None, "kind": "all", "page": page, "limit": page_size})
-            rows = _nested_rows((await invoke(client, tool, args)).data, ("shops", "results", "stores", "items"))
+            search_response = (await invoke(client, tool, args)).data
+            rows = _nested_rows(search_response, ("shops", "results", "stores", "items"))
             for row in rows:
                 shop_id = _first(row, "shop_id", "id", "seller_id")
                 name = _first(row, "name", "shop_name", "seller_name", "title")
@@ -287,6 +381,8 @@ class TorobShopAdapter(SourceAdapter):
                 seen.add(str(shop_id))
                 record = dict(row, _source_id=str(shop_id), name=name, _source_city=_first(row, "city") or city,
                               _source_province=_first(row, "province") or province)
+                record["_source_raw"] = {"search_response": search_response, "shop_record": row}
+                record["_phone_extraction_payload"] = {"shop": row}
                 found.append((record, row))
                 if len(found) >= limit:
                     return AdapterResult(found, True)
@@ -311,7 +407,8 @@ class MarketplaceProductAdapter(SourceAdapter):
             end_page = min(page_count, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
             for page in range(start_page, end_page + 1):
                 search_args = _arguments(client, search_tool, {"query": query, "page": page, "limit": page_size})
-                products = _records((await invoke(client, search_tool, search_args)).data)
+                search_response = (await invoke(client, search_tool, search_args)).data
+                products = _records(search_response)
                 for product in products:
                     product_id = _first(product, "product_id", "id", "productId") if self.source_id == "snappshop" else _first(product, "id", "product_id", "productId")
                     if not product_id:
@@ -328,8 +425,15 @@ class MarketplaceProductAdapter(SourceAdapter):
                         seen.add(str(seller_id))
                         row = dict(offer, _source_id=str(seller_id), name=seller_name,
                                    _source_city=_first(offer, "city") or city,
-                                   _source_province=_first(offer, "province") or province,
-                                   _source_raw={"seller_offer": offer})
+                                   _source_province=_first(offer, "province") or province)
+                        detail_payload = detail if isinstance(detail, (dict, list)) else {"value": detail}
+                        matched_seller_nodes = [node for node in _seller_scoped_payload([product, detail_payload], seller_id) if node is not offer]
+                        scoped_seller_data = [offer, *matched_seller_nodes]
+                        row["_source_raw"] = {
+                            "search_response": search_response, "product_search_record": product,
+                            "product_detail_response": detail_payload, "seller_offer": offer,
+                        }
+                        row["_phone_extraction_payload"] = {"seller": scoped_seller_data}
                         found.append((row, offer))
                         if len(found) >= limit:
                             return AdapterResult(found, True)
@@ -361,7 +465,8 @@ class IranJobsCompanyAdapter(SourceAdapter):
         end_page = min(page_count, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
         for page in range(start_page, end_page + 1):
             args = _arguments(client, tool, {"query": query, "page": page, "site": "all"})
-            companies = _nested_rows((await invoke(client, tool, args)).data, ("companies", "results", "items", "irantalent", "jobinja", "jobvision"))
+            search_response = (await invoke(client, tool, args)).data
+            companies = _nested_rows(search_response, ("companies", "results", "items", "irantalent", "jobinja", "jobvision"))
             for company in companies:
                 name = _first(company, "name", "company_name", "title")
                 identifier = _first(company, "company_id", "id", "uuid", "national_id")
@@ -371,6 +476,8 @@ class IranJobsCompanyAdapter(SourceAdapter):
                 record = dict(company, _source_id=str(identifier), name=name,
                               _source_city=_first(company, "city", "location") or city,
                               _source_province=_first(company, "province") or province)
+                record["_source_raw"] = {"search_response": search_response, "company_record": company}
+                record["_phone_extraction_payload"] = {"company": company}
                 found.append((record, company))
                 if len(found) >= limit:
                     return AdapterResult(found, True)
@@ -393,7 +500,8 @@ class QueraCompanyAdapter(SourceAdapter):
         try:
             for page in range(start_page, end_page + 1):
                 args = _arguments(client, search_tool, {"query": query, "city": city or province or None, "page": page})
-                companies = _records((await invoke(client, search_tool, args)).data)
+                search_response = (await invoke(client, search_tool, args)).data
+                companies = _records(search_response)
                 for company in companies:
                     slug = _first(company, "slug", "company_id", "id")
                     name = _first(company, "name", "company_name", "title")
@@ -408,7 +516,9 @@ class QueraCompanyAdapter(SourceAdapter):
                     record.update(_source_id=str(slug), name=_first(details, "name", "company_name") or name,
                                   _source_city=_first(details, "city") or city,
                                   _source_province=_first(details, "province") or province)
-                    record["_source_raw"] = {"company": company}
+                    record["_source_raw"] = {"search_response": search_response, "company": company,
+                                              "company_profile_response": profile}
+                    record["_phone_extraction_payload"] = {"company": company, "profile": details}
                     found.append((record, details))
                     if len(found) >= limit:
                         return AdapterResult(found, True)
