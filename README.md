@@ -240,3 +240,12 @@ Health check عمومی `GET /health/` متن `ok` می‌دهد و شامل ا�
 منابع Emalls، Basalam و Rasmio برای هر صنف حذف نمی‌شوند: علاوه بر عبارت‌های هم‌معنی، عبارت نزدیک متناسب با هر منبع (فروشگاه، محصول یا شرکت) نیز جست‌وجو می‌شود. عبارت‌های واقعی استفاده‌شده در کارت همان منبع دیده می‌شوند؛ این نتایج تطبیق تقریبی کاتالوگ هستند و لزوماً خود همان واحد صنفی نیستند.
 
 در صفحهٔ job درحال اجرا، «لغو جست‌وجو» درخواست را با Celery revoke می‌کند و وضعیت job و منبع‌های ناتمام را لغوشده ثبت می‌کند. نتیجه‌های ذخیره‌شده باقی می‌مانند؛ اگر توقف فوری worker از broker ممکن نباشد، worker در پایان درخواست جاری یا timeout منبع، لغو را اعمال می‌کند.
+
+
+## Update 5 data migration and phone privacy
+
+Deploy the latest code and apply all migrations with the same Python executable used by the web and Celery processes, including `0012_mobile_phone_evidence_and_raw_retention` and `0013_businessphone_permission_confirmed_at_and_more`. For local Windows development, run `\.venv\Scripts\python.exe manage.py migrate`; on Linux, use `./.venv/bin/python manage.py migrate`. Do not run migrations from a different Python environment than the application.
+
+The shared phone extractor preserves valid Iranian mobile candidates in E.164 form and stores source/field-path evidence. Raw provider payloads are bounded by `SOURCE_RAW_RESPONSE_MAX_BYTES` and retained for `SOURCE_RAW_RESPONSE_RETENTION_DAYS` (default 90 days; 0 disables raw payload storage). Daily deletion requires Celery Beat and a functioning worker. Marketing-only export is available with `?permission=marketing` and requires an auditable permission record; opt-outs and globally suppressed numbers are excluded. A public business contact is not marketing consent.
+
+Website crawling and general web search are not enabled: this checkout has no approved Search API credentials or configured website allowlist. Search-result scraping and unbounded URL fetching are deliberately absent.

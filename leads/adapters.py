@@ -145,6 +145,7 @@ class EmallsAdapter(SourceAdapter):
                         record["_source_id"] = str(shop_id)
                         record["_source_city"] = _first(profile if isinstance(profile, dict) else {}, "city") or _first(offer, "city") or city
                         record["_source_province"] = _first(profile if isinstance(profile, dict) else {}, "province") or _first(offer, "province") or province
+                        record["_source_raw"] = {"product": product, "offer": offer}
                         found.append((record, profile))
                         if len(found) >= limit:
                             return AdapterResult(found, True)
@@ -188,6 +189,7 @@ class BasalamAdapter(SourceAdapter):
                     record["name"] = _first(profile if isinstance(profile, dict) else {}, "name", "vendor_name", "title") or _first(product, "shop_name", "vendor_name")
                     record["_source_city"] = _first(profile if isinstance(profile, dict) else {}, "city")
                     record["_source_province"] = _first(profile if isinstance(profile, dict) else {}, "province")
+                    record["_source_raw"] = {"product": product}
                     found.append((record, profile))
                     if len(found) >= limit:
                         return AdapterResult(found, True)
@@ -326,7 +328,8 @@ class MarketplaceProductAdapter(SourceAdapter):
                         seen.add(str(seller_id))
                         row = dict(offer, _source_id=str(seller_id), name=seller_name,
                                    _source_city=_first(offer, "city") or city,
-                                   _source_province=_first(offer, "province") or province)
+                                   _source_province=_first(offer, "province") or province,
+                                   _source_raw={"seller_offer": offer})
                         found.append((row, offer))
                         if len(found) >= limit:
                             return AdapterResult(found, True)
@@ -405,6 +408,7 @@ class QueraCompanyAdapter(SourceAdapter):
                     record.update(_source_id=str(slug), name=_first(details, "name", "company_name") or name,
                                   _source_city=_first(details, "city") or city,
                                   _source_province=_first(details, "province") or province)
+                    record["_source_raw"] = {"company": company}
                     found.append((record, details))
                     if len(found) >= limit:
                         return AdapterResult(found, True)

@@ -16,8 +16,8 @@ from redis import Redis
 
 from .adapters import SOURCE_ADAPTERS
 from .mcp_client import MCPBudgetExhausted, MCPSourceError, SOURCE_REGISTRY, source_session
-from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
-from .normalization import has_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
+from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
+from .normalization import extract_iranian_mobiles, has_iranian_mobile, normalize_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +183,19 @@ def _format_phone_values(value):
 
 
 def _field_values(search_record, detail):
+    detail_raw = detail
     detail = detail if isinstance(detail, dict) else {}
+    search_raw = search_record.get("_source_raw", search_record) if isinstance(search_record, dict) else search_record
+    mobile_candidates = [
+        *extract_iranian_mobiles(
+            search_raw, path="search", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
+            max_nodes=settings.PHONE_EXTRACTION_MAX_NODES, max_text_chars=settings.PHONE_EXTRACTION_MAX_STRING_CHARS,
+        ),
+        *extract_iranian_mobiles(
+            detail_raw, path="detail", max_depth=settings.PHONE_EXTRACTION_MAX_DEPTH,
+            max_nodes=settings.PHONE_EXTRACTION_MAX_NODES, max_text_chars=settings.PHONE_EXTRACTION_MAX_STRING_CHARS,
+        ),
+    ]
     name = _first(detail, "name", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "title") or _first(search_record, "name", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "title", "maintext")
     address = _first(detail, "address", "formatted_address") or _first(search_record, "address", "subtext1")
     # A generic `url` on map records points to the provider's place page, not
@@ -193,9 +205,7 @@ def _field_values(search_record, detail):
     detail_links = detail.get("links") if isinstance(detail.get("links"), dict) else {}
     search_links = search_record.get("links") if isinstance(search_record.get("links"), dict) else {}
     website = website or _first(detail_links, "website", "official_website", "web") or _first(search_links, "website", "official_website", "web")
-    phones = _format_phone_values(_first(detail, "phones", "phone", "telephone"))
-    phones += _format_phone_values(_first(search_record, "phones", "phone", "telephone"))
-    phones = list(dict.fromkeys(phones))
+    phones = list(dict.fromkeys(candidate.raw_value for candidate in mobile_candidates))
     emails = _format_phone_values(_first(detail, "emails", "email", "contact_email"))
     emails += _format_phone_values(_first(search_record, "emails", "email", "contact_email"))
     emails = list(dict.fromkeys(email for email in emails if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)))
@@ -215,6 +225,7 @@ def _field_values(search_record, detail):
         "name": str(name or "").strip(),
         "address": str(address or "").strip(),
         "phones": phones,
+        "mobile_candidates": mobile_candidates,
         "emails": emails,
         "social_urls": socials,
         "website": str(website or "").strip(),
@@ -237,33 +248,49 @@ def _source_url(source, record_id):
     return ""
 
 
-_SAFE_SOURCE_FIELDS = {
-    "id", "place_id", "token", "slug", "shop_id", "seller_id", "seller_code", "merchant_id", "vendor_id", "company_id", "national_id", "national_code",
-    "name", "title", "maintext", "shop_name", "seller", "seller_name", "vendor_name", "company_name", "category", "business_category", "industry", "jobs", "company_url", "shop_url",
-    "activity", "business_type", "company_type", "kind", "address", "formatted_address", "city", "province",
-    "phone", "phones", "telephone", "email", "emails", "contact_email", "website", "web", "url", "profile_url",
-    "source_url", "social_links", "socials", "social", "instagram", "telegram", "linkedin", "lat", "latitude", "lng", "lon", "longitude",
-}
-
-
 def _safe_source_response(value):
-    """Keep only business identity/contact/location fields; discard unrelated personal and listing data."""
-    if isinstance(value, dict):
-        result = {}
-        for key, item in value.items():
-            if key not in _SAFE_SOURCE_FIELDS and key != "links":
-                continue
-            if key == "links" and isinstance(item, dict):
-                item = {link_key: link for link_key, link in item.items() if link_key in {"web", "website", "instagram", "telegram", "linkedin"}}
-            result[key] = _safe_source_response(item)
-        return result
-    if isinstance(value, list):
-        return [_safe_source_response(item) for item in value[:20]]
-    if isinstance(value, str):
-        return value[:2000]
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return str(value)[:2000]
+    """Retain unknown source fields within configured structural and byte limits."""
+    limits = {"nodes": 0}
+
+    def convert(item, depth=0):
+        limits["nodes"] += 1
+        if depth > settings.PHONE_EXTRACTION_MAX_DEPTH or limits["nodes"] > settings.PHONE_EXTRACTION_MAX_NODES:
+            return {"__truncated__": True}
+        if isinstance(item, dict):
+            return {str(key)[:200]: convert(child, depth + 1) for key, child in list(item.items())[:1000]}
+        if isinstance(item, (list, tuple)):
+            return [convert(child, depth + 1) for child in item[:1000]]
+        if isinstance(item, str):
+            return item[:settings.PHONE_EXTRACTION_MAX_STRING_CHARS]
+        if isinstance(item, (int, float, bool)) or item is None:
+            return item
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            try:
+                return convert(model_dump(mode="json"), depth + 1)
+            except Exception:
+                pass
+        try:
+            return convert(vars(item), depth + 1)
+        except (TypeError, AttributeError):
+            return str(item)[:settings.PHONE_EXTRACTION_MAX_STRING_CHARS]
+
+    safe = convert(value)
+    encoded = json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) <= settings.SOURCE_RAW_RESPONSE_MAX_BYTES:
+        return safe
+    # Reserve enough room for the wrapper itself so the persisted JSON always
+    # respects the configured byte budget, including multibyte UTF-8 payloads.
+    limit = settings.SOURCE_RAW_RESPONSE_MAX_BYTES
+    wrapper = {"__truncated__": True, "max_bytes": limit, "json_prefix": ""}
+    overhead = len(json.dumps(wrapper, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    preview_budget = max(0, limit - overhead)
+    preview = encoded[:preview_budget].decode("utf-8", errors="ignore")
+    wrapper["json_prefix"] = preview
+    while len(json.dumps(wrapper, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > limit and preview:
+        preview = preview[:-1]
+        wrapper["json_prefix"] = preview
+    return wrapper
 
 
 def _cached_source_detail(source, record_id):
@@ -340,9 +367,17 @@ def save_lead(job, source, search_record, detail, return_created=False):
     if not fields["name"]:
         return None
     website, _ = normalize_website(fields["website"])
-    valid_phones = [normalize_phone(phone) for phone in fields["phones"] if phone_is_valid(phone)]
-    invalid_phone_values = [str(phone).strip() for phone in fields["phones"] if str(phone).strip() and not phone_is_valid(phone)]
-    all_phone_values = list(dict.fromkeys(valid_phones))
+    valid_phones = list(dict.fromkeys(
+        number for candidate in fields["mobile_candidates"]
+        if (number := normalize_iranian_mobile(candidate.raw_value))
+    ))
+    phone_inputs = []
+    for source_data in (detail if isinstance(detail, dict) else {}, search_record):
+        if isinstance(source_data, dict):
+            phone_inputs.extend(_format_phone_values(_first(source_data, "phone", "phones", "telephone")))
+    phone_evidence_values = list(dict.fromkeys([*fields["phones"], *phone_inputs]))
+    invalid_phone_values = [str(phone).strip() for phone in phone_inputs if str(phone).strip() and not phone_is_valid(phone)]
+    all_phone_values = valid_phones
     lead = _find_match(job, source, record_id, fields)
     was_mobile = bool(lead and (lead.has_mobile_phone or has_iranian_mobile(lead.phone_numbers)))
     source_ids = dict(lead.source_record_ids) if lead else {}
@@ -371,7 +406,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
         phone_status = BusinessLead.PhoneStatus.INVALID
     elif valid_phones:
         phone_status = BusinessLead.PhoneStatus.FOUND_PUBLIC
-    elif "phone" not in SOURCE_REGISTRY[source].get("fields", []):
+    elif "phone" not in SOURCE_REGISTRY[source].get("fields", []) and not phone_inputs:
         phone_status = BusinessLead.PhoneStatus.NOT_PROVIDED
     else:
         phone_status = BusinessLead.PhoneStatus.NOT_FOUND
@@ -411,9 +446,51 @@ def save_lead(job, source, search_record, detail, return_created=False):
         )
     lead.confidence_score = calculate_confidence(lead)
     lead.save(update_fields=["confidence_score"])
-    raw = {"search": _safe_source_response(search_record), "details": _safe_source_response(detail)}
+    retention_days = settings.SOURCE_RAW_RESPONSE_RETENTION_DAYS
+    raw = _safe_source_response({
+        "search": search_record.get("_source_raw", search_record) if isinstance(search_record, dict) else search_record,
+        "details": detail,
+    }) if retention_days else {}
+    raw_expires_at = timezone.now() + timedelta(days=retention_days) if retention_days else None
+    source_url = fields["profile_url"] or _source_url(source, record_id)
+    for candidate in fields["mobile_candidates"]:
+        normalized = normalize_iranian_mobile(candidate.raw_value)
+        if not normalized:
+            continue
+        permission = (
+            BusinessPhone.PermissionStatus.PUBLIC_BUSINESS_CONTACT if candidate.contact_context
+            else BusinessPhone.PermissionStatus.UNKNOWN
+        )
+        phone, _ = BusinessPhone.objects.get_or_create(
+            business_lead=lead, normalized_number=normalized,
+            defaults={"permission_status": permission},
+        )
+        if phone.last_seen_at < timezone.now():
+            phone.last_seen_at = timezone.now()
+            phone.save(update_fields=["last_seen_at"])
+        if SuppressedPhone.objects.filter(normalized_number=normalized).exists():
+            phone.permission_status = BusinessPhone.PermissionStatus.SUPPRESSED
+            phone.save(update_fields=["permission_status"])
+        elif candidate.contact_context and phone.permission_status == BusinessPhone.PermissionStatus.UNKNOWN:
+            phone.permission_status = BusinessPhone.PermissionStatus.PUBLIC_BUSINESS_CONTACT
+            phone.save(update_fields=["permission_status"])
+        match_status = (
+            BusinessPhoneEvidence.MatchStatus.SOURCE_CONTACT_FIELD if candidate.contact_context
+            else BusinessPhoneEvidence.MatchStatus.SOURCE_RECORD
+        )
+        confidence = 0.9 if candidate.field_path.startswith("detail") else 0.7
+        if candidate.contact_context:
+            confidence = min(0.99, confidence + 0.08)
+        BusinessPhoneEvidence.objects.get_or_create(
+            business_phone=phone, source_name=source, source_record_id=record_id,
+            field_path=candidate.field_path[:512], raw_value=candidate.raw_value[:160],
+            defaults={
+                "source_url": source_url, "confidence_score": confidence,
+                "business_match_status": match_status,
+            },
+        )
     values = {
-        "name": fields["name"], "address": fields["address"], "phone_numbers": fields["phones"],
+        "name": fields["name"], "address": fields["address"], "phone_numbers": phone_evidence_values,
         "website": fields["website"], "category": fields["category"], "latitude": fields["lat"], "longitude": fields["lng"],
         "emails": fields["emails"], "social_urls": fields["social_urls"], "national_id": fields["national_id"],
         "business_type": fields["business_type"],
@@ -424,7 +501,12 @@ def save_lead(job, source, search_record, detail, return_created=False):
             continue
         normalized_value = _normalized_evidence_value(field_name, value)
         if field_name == "phone_numbers":
-            validation_status = "format_valid_unverified" if all(phone_is_valid(phone) for phone in value) else "contains_invalid_format"
+            if all(normalize_iranian_mobile(phone) for phone in value):
+                validation_status = "format_valid_unverified"
+            elif all(phone_is_valid(phone) for phone in value):
+                validation_status = "non_mobile_excluded"
+            else:
+                validation_status = "contains_invalid_format"
         elif field_name == "emails":
             validation_status = "syntax_valid_unverified"
         elif field_name == "website":
@@ -435,7 +517,8 @@ def save_lead(job, source, search_record, detail, return_created=False):
             business_lead=lead, source_name=source, source_record_id=record_id, field_name=field_name,
             field_value=json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else str(value),
             defaults={
-                "source_url": fields["profile_url"] or _source_url(source, record_id), "raw_response": raw,
+            "source_url": source_url, "raw_response": raw,
+                "raw_response_expires_at": raw_expires_at,
                 "normalized_value": json.dumps(normalized_value, ensure_ascii=False) if isinstance(normalized_value, (list, dict)) else str(normalized_value),
                 "confidence_score": 0.8 if source in {"neshan", "balad", "emalls", "rasmio"} else 0.6,
                 "validation_status": validation_status,
@@ -445,14 +528,14 @@ def save_lead(job, source, search_record, detail, return_created=False):
     LeadEvidence.objects.get_or_create(
         business_lead=lead, source_name=source, source_record_id=record_id,
         field_name="raw_response", field_value="Original search and detail response",
-        defaults={"source_url": fields["profile_url"] or _source_url(source, record_id), "raw_response": raw},
+        defaults={"source_url": source_url, "raw_response": raw, "raw_response_expires_at": raw_expires_at},
     )
     return (lead, has_mobile_phone and not was_mobile) if return_created else lead
 
 
 def _normalized_evidence_value(field_name, value):
     if field_name == "phone_numbers":
-        return [normalize_phone(phone) or str(phone).strip() for phone in value]
+        return [normalize_iranian_mobile(phone) or str(phone).strip() for phone in value]
     if field_name == "emails":
         return [str(email).strip().lower() for email in value]
     if field_name == "website":

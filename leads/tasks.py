@@ -18,6 +18,17 @@ def _successful_lead_count(job):
     return job.leads.filter(has_mobile_phone=True).count()
 
 
+@shared_task(name="leads.purge_expired_source_payloads")
+def purge_expired_source_payloads():
+    from .models import LeadEvidence
+
+    now = timezone.now()
+    count = LeadEvidence.objects.filter(raw_response_expires_at__lte=now).exclude(raw_response={}).update(
+        raw_response={}, raw_response_purged_at=now,
+    )
+    return {"purged": count}
+
+
 @shared_task(bind=True, name="leads.run_search_job", acks_late=True, reject_on_worker_lost=True, time_limit=900, soft_time_limit=840)
 def run_search_job(self, job_id):
     started_at = timezone.now()

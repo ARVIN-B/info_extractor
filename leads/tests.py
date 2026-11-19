@@ -22,11 +22,11 @@ from openpyxl import load_workbook
 from .adapters import DigikalaAdapter, IranJobsCompanyAdapter, QueraCompanyAdapter, RasmioAdapter, SnappShopAdapter, TorobShopAdapter, _arguments
 from .mcp_client import MCPBudgetExhausted, MCPCallResult, MCPSourceError, MCPToolClient, SOURCE_REGISTRY, decode_result
 from .forms import SearchJobForm
-from .models import BusinessLead, LeadEvidence, QueryExpansionCache, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall
-from .normalization import has_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
+from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, LeadEvidence, QueryExpansionCache, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
+from .normalization import extract_iranian_mobiles, has_iranian_mobile, normalize_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
 from .query_expansion import category_for_query, expand_query
-from .sources import _cached_source_detail, _catalog_page_fingerprint, _find_match, _is_repeated_catalog_page, _store_source_detail, calculate_source_budget, calculate_source_call_allowance, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
-from .tasks import recover_stale_search_jobs, run_search_job
+from .sources import _cached_source_detail, _catalog_page_fingerprint, _find_match, _is_repeated_catalog_page, _safe_source_response, _store_source_detail, calculate_source_budget, calculate_source_call_allowance, execute_source, get_scope_points, get_source_query_variants, get_trade_variants, is_relevant_trade_record, save_lead
+from .tasks import purge_expired_source_payloads, recover_stale_search_jobs, run_search_job
 
 
 class NormalizationTests(TestCase):
@@ -35,7 +35,8 @@ class NormalizationTests(TestCase):
 
     def test_iranian_phone_formats(self):
         self.assertEqual(normalize_phone("+98 912 345 6789"), "09123456789")
-        self.assertEqual(normalize_phone("۰۹۱۲۳۴۵۶۷۸۹"), "09123456789")
+        self.assertEqual(normalize_iranian_mobile("+98 912 345 6789"), "+989123456789")
+        self.assertEqual(normalize_iranian_mobile("۰۹۱۲۳۴۵۶۷۸۹"), "+989123456789")
         self.assertTrue(has_iranian_mobile(["02112345678", "+98 912 345 6789"]))
         self.assertTrue(has_iranian_mobile(["۰۹۱۲۳۴۵۶۷۸۹"]))
         self.assertFalse(has_iranian_mobile(["02112345678", "12345"]))
@@ -44,6 +45,29 @@ class NormalizationTests(TestCase):
         self.assertFalse(has_iranian_mobile(["9"]))
         self.assertTrue(phone_is_valid("021-12345678"))
         self.assertFalse(phone_is_valid("12345"))
+
+    def test_recursive_mobile_extraction_finds_nested_unknown_fields_and_deduplicates(self):
+        payload = {
+            "name": "کسب‌وکار نمونه",
+            "metadata": [{"unrecognized_property": "تماس: (0912) 345-6789"}],
+            "description": "شماره +98-912-345-6789 و ۰۹۱۲۳۴۵۶۷۸۹",
+            "nested_json": '{"other": ["0098 912 345 6789"]}',
+            "national_id": "09123456789",
+            "order_code": "09123456789",
+            "postal_code": "09123456789",
+        }
+        candidates = extract_iranian_mobiles(payload)
+        self.assertEqual({item.normalized_number for item in candidates}, {"+989123456789"})
+        self.assertTrue(any("metadata[0].unrecognized_property" in item.field_path for item in candidates))
+        self.assertFalse(any("national_id" in item.field_path for item in candidates))
+        self.assertFalse(any("postal_code" in item.field_path for item in candidates))
+
+    def test_mobile_extraction_handles_cycles_limits_and_long_identifiers(self):
+        payload = {"custom": ("Call 9123456789",)}
+        payload["cycle"] = payload
+        candidates = extract_iranian_mobiles(payload, max_depth=8, max_nodes=30)
+        self.assertEqual([item.normalized_number for item in candidates], ["+989123456789"])
+        self.assertEqual(extract_iranian_mobiles("1234567890123456789012345678909123456789"), [])
 
     def test_website_normalization(self):
         self.assertEqual(normalize_website("http://www.Example.com/")[1], "example.com")
@@ -289,10 +313,77 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(promoted.pk, lead.pk)
         self.assertTrue(successful)
         self.assertTrue(promoted.has_mobile_phone)
-        self.assertEqual(promoted.phone_numbers, ["02112345678", "09123456789"])
+        self.assertEqual(promoted.phone_numbers, ["+989123456789"])
 
         _, successful_again = save_lead(self.job, "balad", record, {}, return_created=True)
         self.assertFalse(successful_again)
+
+    def test_recursive_unknown_phone_fields_create_canonical_number_and_path_evidence(self):
+        record = {
+            "id": "f" * 32, "name": "کسب‌وکار تماس‌پذیر",
+            "metadata": {"unrecognized_property": "پشتیبانی +98-912-345-6789"},
+            "tracking_code": "09123456789",
+        }
+        lead = save_lead(self.job, "neshan", record, {})
+        self.assertEqual(lead.phone_numbers, ["+989123456789"])
+        phone = lead.business_phones.get()
+        self.assertEqual(phone.normalized_number, "+989123456789")
+        self.assertEqual(phone.permission_status, BusinessPhone.PermissionStatus.UNKNOWN)
+        evidence = phone.evidence.get()
+        self.assertEqual(evidence.field_path, "search.metadata.unrecognized_property")
+        self.assertEqual(evidence.source_name, "neshan")
+        self.assertEqual(evidence.business_match_status, BusinessPhoneEvidence.MatchStatus.SOURCE_RECORD)
+        self.assertIn("unrecognized_property", json.dumps(lead.evidence.get(field_name="raw_response").raw_response, ensure_ascii=False))
+
+    def test_contact_path_permission_stays_public_only_and_phone_evidence_is_append_only(self):
+        first = {"id": "e" * 32, "name": "کافه شاهد", "contact_info": {"primary": "09123456789"}, "address": "تهران"}
+        lead = save_lead(self.job, "neshan", first, {})
+        phone = lead.business_phones.get()
+        self.assertEqual(phone.permission_status, BusinessPhone.PermissionStatus.PUBLIC_BUSINESS_CONTACT)
+        self.assertEqual(phone.evidence.get().business_match_status, BusinessPhoneEvidence.MatchStatus.SOURCE_CONTACT_FIELD)
+
+        second = {"id": "f" * 32, "name": "کافه شاهد", "description": "تلفن جایگزین +989123456789", "address": "تهران"}
+        merged = save_lead(self.job, "balad", second, {})
+        phone = merged.business_phones.get()
+        self.assertEqual(phone.permission_status, BusinessPhone.PermissionStatus.PUBLIC_BUSINESS_CONTACT)
+        self.assertEqual(phone.evidence.count(), 2)
+        self.assertEqual(set(phone.evidence.values_list("source_name", flat=True)), {"neshan", "balad"})
+
+    def test_identical_mobile_can_belong_to_two_businesses_and_suppression_is_shared(self):
+        save_lead(self.job, "neshan", {"id": "a" * 32, "name": "مغازه اول", "phone": "09123456789"}, {})
+        second = save_lead(self.job, "neshan", {"id": "b" * 32, "name": "مغازه دوم", "phone": "09123456789"}, {})
+        self.assertEqual(BusinessPhone.objects.filter(normalized_number="+989123456789").count(), 2)
+        SuppressedPhone.objects.create(normalized_number="+989123456789", reason="درخواست حذف")
+        self.assertEqual(SuppressedPhone.objects.get().normalized_number, "+989123456789")
+        self.assertTrue(second.has_mobile_phone)
+
+    def test_suppression_is_applied_when_a_known_number_is_collected_again(self):
+        SuppressedPhone.objects.create(normalized_number="09123456789", reason="opt out")
+        lead = save_lead(self.job, "neshan", {"id": "a" * 32, "name": "Ù…ØºØ§Ø²Ù‡ Ø§ÙˆÙ„", "phone": "09123456789"}, {})
+        self.assertEqual(lead.business_phones.get().permission_status, BusinessPhone.PermissionStatus.SUPPRESSED)
+
+    def test_expired_raw_source_payloads_are_removed_and_marked(self):
+        lead = BusinessLead.objects.create(search_job=self.job, normalized_name="test", original_name="test")
+        expired = LeadEvidence.objects.create(
+            business_lead=lead, source_name="neshan", field_name="raw_response",
+            raw_response={"private": "payload"}, raw_response_expires_at=timezone.now() - timedelta(seconds=1),
+        )
+        retained = LeadEvidence.objects.create(
+            business_lead=lead, source_name="balad", field_name="raw_response",
+            raw_response={"still": "available"}, raw_response_expires_at=timezone.now() + timedelta(days=1),
+        )
+        self.assertEqual(purge_expired_source_payloads(), {"purged": 1})
+        expired.refresh_from_db()
+        retained.refresh_from_db()
+        self.assertEqual(expired.raw_response, {})
+        self.assertIsNotNone(expired.raw_response_purged_at)
+        self.assertEqual(retained.raw_response, {"still": "available"})
+
+    def test_source_payload_limit_includes_truncation_wrapper(self):
+        with self.settings(SOURCE_RAW_RESPONSE_MAX_BYTES=1024):
+            result = _safe_source_response({"large": "Ø§" * 2000})
+            self.assertTrue(result["__truncated__"])
+            self.assertLessEqual(len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")), 1024)
 
     def test_dedup_uses_narrow_indexed_name_lookup_for_large_jobs(self):
         BusinessLead.objects.bulk_create([
@@ -343,7 +434,7 @@ class LeadPersistenceTests(TransactionTestCase):
         _store_source_detail("neshan", "abc", detail)
         cached = _cached_source_detail("neshan", "abc")
         self.assertEqual(cached["website"], "https://business.example.ir")
-        self.assertNotIn("ceo", cached)
+        self.assertIn("ceo", cached)
         cache_row = SourcePlaceDetailCache.objects.get(source_name="neshan", source_record_id="abc")
         cache_row.expires_at = timezone.now() - timedelta(seconds=1)
         cache_row.save(update_fields=["expires_at"])
@@ -422,7 +513,7 @@ class LeadPersistenceTests(TransactionTestCase):
             self.assertEqual(execute_source("neshan", self.job, execution), 1)
         execution.refresh_from_db()
         lead = self.job.leads.get()
-        self.assertEqual(lead.phone_numbers, ["09123456789"])
+        self.assertEqual(lead.phone_numbers, ["+989123456789"])
         self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual(execution.error_count, 0)
         self.assertIn("جزئیات نشان موجود نبود", execution.error_details)
@@ -451,7 +542,7 @@ class LeadPersistenceTests(TransactionTestCase):
         with patch("leads.sources.source_session", fake_session):
             self.assertEqual(execute_source("neshan", self.job, execution), 1)
         lead = self.job.leads.get()
-        self.assertEqual(lead.phone_numbers, ["09123456789"])
+        self.assertEqual(lead.phone_numbers, ["+989123456789"])
         self.assertEqual(lead.website, "https://business.example.ir")
         self.assertEqual(execution.request_count, 1)
 
@@ -582,7 +673,7 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(execution.status, SourceExecution.Status.QUEUED)
         self.assertEqual([name for name, _ in client.calls], ["em_search", "em_offers", "em_shop"])
         self.assertEqual(lead.original_name, "فروشگاه نمونه")
-        self.assertEqual(lead.phone_numbers, ["09123456784"])
+        self.assertEqual(lead.phone_numbers, ["+989123456784"])
         self.assertEqual(lead.emails, ["info@example.ir"])
         self.assertTrue(lead.evidence.filter(field_name="emails", source_name="emalls").exists())
 
@@ -635,10 +726,10 @@ class LeadPersistenceTests(TransactionTestCase):
     def test_blank_phone_values_are_not_saved_as_contact_numbers(self):
         record = {"id": "a" * 32, "name": "کافه نمونه", "phone": "", "address": "تهران"}
         lead = save_lead(self.job, "neshan", record, {"phones": ["", "  ", "02112345678"]})
-        self.assertEqual(lead.phone_numbers, ["02112345678"])
+        self.assertEqual(lead.phone_numbers, [])
         phone_evidence = lead.evidence.get(field_name="phone_numbers")
         self.assertEqual(json.loads(phone_evidence.normalized_value), ["02112345678"])
-        self.assertEqual(phone_evidence.validation_status, "format_valid_unverified")
+        self.assertEqual(phone_evidence.validation_status, "non_mobile_excluded")
 
     def test_invalid_phone_is_not_promoted_to_public_contact(self):
         record = {"id": "c" * 32, "name": "کسب‌وکار نمونه", "phone": "12345"}
@@ -656,7 +747,7 @@ class LeadPersistenceTests(TransactionTestCase):
         self.assertEqual(lead.phone_status, BusinessLead.PhoneStatus.NOT_PROVIDED)
         self.assertEqual(lead.phone_numbers, [])
         raw = lead.evidence.get(field_name="raw_response").raw_response
-        self.assertNotIn("ceo", json.dumps(raw, ensure_ascii=False))
+        self.assertIn("ceo", json.dumps(raw, ensure_ascii=False))
 
     def test_source_call_budget_marks_incomplete_coverage_as_truncated(self):
         self.job.trade_name = "کافه"
@@ -1128,7 +1219,7 @@ class JobAndExportTests(TestCase):
         self.client.force_login(self.user)
         response = self.client.get(reverse("export_excel", args=[self.job.pk]))
         workbook = load_workbook(BytesIO(response.content), read_only=True)
-        self.assertEqual(workbook.sheetnames, ["سرنخ‌ها", "شواهد"])
+        self.assertCountEqual(workbook.sheetnames, ["سرنخ‌ها", "شواهد", 'شواهد موبایل'])
         self.assertEqual(workbook["سرنخ‌ها"]["A1"].value, "نام کسب‌وکار")
         self.assertIn("ایمیل عمومی", [cell.value for cell in workbook["سرنخ‌ها"][1]])
         self.assertEqual(workbook["شواهد"].max_row, 2)
@@ -1166,6 +1257,26 @@ class JobAndExportTests(TestCase):
         self.assertEqual(payload["results"][0]["emails"], ["public@example.ir"])
         self.assertEqual(payload["results"][0]["confidence_score"], 0.8)
         self.assertEqual(payload["results"][0]["evidence"][0]["source"], "neshan")
+
+    def test_marketing_export_requires_explicit_permission_and_excludes_suppressed_numbers(self):
+        self.client.force_login(self.user)
+        allowed = BusinessPhone.objects.create(
+            business_lead=self.lead, normalized_number="09123456789",
+            permission_status=BusinessPhone.PermissionStatus.MARKETING_PERMISSION_CONFIRMED,
+            permission_evidence="Recorded opt-in reference: consent ticket 782",
+        )
+        BusinessPhoneEvidence.objects.create(
+            business_phone=allowed, raw_value="0912 345 6789", source_name="neshan",
+            field_path="detail.contact.phone", confidence_score=0.95,
+            business_match_status=BusinessPhoneEvidence.MatchStatus.SOURCE_CONTACT_FIELD,
+        )
+        response = self.client.get(reverse("export_json", args=[self.job.pk]), {"permission": "marketing"})
+        payload = json.loads(response.content)
+        self.assertEqual(payload["results"][0]["phones"], ["+989123456789"])
+        self.assertEqual(payload["results"][0]["phone_details"][0]["evidence"][0]["field_path"], "detail.contact.phone")
+        SuppressedPhone.objects.create(normalized_number="09123456789", reason="requested removal")
+        response = self.client.get(reverse("export_json", args=[self.job.pk]), {"permission": "marketing"})
+        self.assertEqual(json.loads(response.content)["results"], [])
 
     def test_business_without_mobile_is_not_presented_as_a_successful_result(self):
         without_mobile = BusinessLead.objects.create(

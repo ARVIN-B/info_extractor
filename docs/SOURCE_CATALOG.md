@@ -41,3 +41,10 @@
 - [Neshan MCP](https://github.com/sepehr071/neshan-mcp)
 
 For Emalls, Basalam, and Rasmio, the planner now tries source-specific nearby query variants instead of marking the source irrelevant and skipping it. The exact attempted phrases are recorded on the source card. Marketplace and registry matches can be related alternatives rather than the same type of storefront; interpret each result using its source and business category.
+
+
+## Update 5 phone extraction and source coverage notes
+
+All configured adapters now preserve their provider-specific raw row where available, and a shared bounded recursive extractor scans nested fields and JSON strings. Results store valid Iranian mobiles in E.164 format and track source, source record, field path, and raw candidate per number. The phone-yield counts shown on each job page come from collected evidence, so a connected/schema-valid source with zero phone evidence is not presented as having found mobiles.
+
+A business profile URL supplied by a map provider remains provenance and is not treated as an official business website. No arbitrary website crawler or search-results scraper is enabled in this update. There is no configured official Search API credential or customer website-crawl allowlist. Review provider terms, quotas, contact-field availability, and any required credentials before enabling additional coverage.

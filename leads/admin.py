@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import BusinessLead, LeadEvidence, SearchJob, SourceExecution, SourceRateLimit, SourceToolCall
+from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, LeadEvidence, SearchJob, SourceExecution, SourceRateLimit, SourceToolCall, SuppressedPhone
 
 
 class SourceExecutionInline(admin.TabularInline):
@@ -26,7 +26,21 @@ class BusinessLeadAdmin(admin.ModelAdmin):
 
 
 admin.site.register(LeadEvidence)
+admin.site.register(BusinessPhoneEvidence)
 admin.site.register(SourceToolCall)
+
+
+@admin.register(BusinessPhone)
+class BusinessPhoneAdmin(admin.ModelAdmin):
+    list_display = ("normalized_number", "business_lead", "permission_status", "first_seen_at")
+    list_filter = ("permission_status",)
+    search_fields = ("normalized_number", "business_lead__original_name", "business_lead__city")
+
+
+@admin.register(SuppressedPhone)
+class SuppressedPhoneAdmin(admin.ModelAdmin):
+    list_display = ("normalized_number", "reason", "created_at")
+    search_fields = ("normalized_number", "reason")
 
 
 @admin.register(SourceRateLimit)

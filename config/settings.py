@@ -151,6 +151,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "leads.recover_stale_search_jobs",
         "schedule": 300.0,
     },
+    "purge-expired-source-payloads-daily": {
+        "task": "leads.purge_expired_source_payloads",
+        "schedule": 86400.0,
+    },
 }
 
 SOURCE_TIMEOUT_SECONDS = int(os.environ.get("SOURCE_TIMEOUT_SECONDS", "45"))
@@ -171,6 +175,11 @@ SEARCH_QUERY_LLM_MAX_RETRIES = min(2, max(0, int(os.environ.get("SEARCH_QUERY_LL
 SEARCH_QUERY_MAX_VARIANTS = min(50, max(0, int(os.environ.get("SEARCH_QUERY_MAX_VARIANTS", "8"))))
 SEARCH_QUERY_MIN_RELEVANCE = min(1.0, max(0.0, float(os.environ.get("SEARCH_QUERY_MIN_RELEVANCE", "0.72"))))
 SEARCH_QUERY_CACHE_TTL_SECONDS = min(31536000, max(0, int(os.environ.get("SEARCH_QUERY_CACHE_TTL_SECONDS", "604800"))))
+PHONE_EXTRACTION_MAX_DEPTH = max(1, min(32, int(os.environ.get("PHONE_EXTRACTION_MAX_DEPTH", "12"))))
+PHONE_EXTRACTION_MAX_NODES = max(100, min(100000, int(os.environ.get("PHONE_EXTRACTION_MAX_NODES", "10000"))))
+PHONE_EXTRACTION_MAX_STRING_CHARS = max(1000, min(1000000, int(os.environ.get("PHONE_EXTRACTION_MAX_STRING_CHARS", "20000"))))
+SOURCE_RAW_RESPONSE_MAX_BYTES = max(1024, min(1048576, int(os.environ.get("SOURCE_RAW_RESPONSE_MAX_BYTES", "65536"))))
+SOURCE_RAW_RESPONSE_RETENTION_DAYS = max(0, min(3650, int(os.environ.get("SOURCE_RAW_RESPONSE_RETENTION_DAYS", "90"))))
 SOURCE_RATE_LIMIT_COOLDOWN_SECONDS = int(
     os.environ.get("SOURCE_RATE_LIMIT_COOLDOWN_SECONDS", "60")
 )

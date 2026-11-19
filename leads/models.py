@@ -2,7 +2,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
-from .normalization import has_iranian_mobile
+from .normalization import normalize_iranian_mobile
 
 
 class SearchJob(models.Model):
@@ -176,14 +176,101 @@ class BusinessLead(models.Model):
         indexes = [models.Index(fields=["search_job", "city"]), models.Index(fields=["search_job", "verification_status"])]
 
     def save(self, *args, **kwargs):
-        self.has_mobile_phone = has_iranian_mobile(self.phone_numbers)
+        self.phone_numbers = list(dict.fromkeys(
+            number for value in self.phone_numbers or []
+            if (number := normalize_iranian_mobile(value))
+        ))
+        self.has_mobile_phone = bool(self.phone_numbers)
         update_fields = kwargs.get("update_fields")
         if update_fields is not None:
-            kwargs["update_fields"] = set(update_fields) | {"has_mobile_phone"}
+            kwargs["update_fields"] = set(update_fields) | {"phone_numbers", "has_mobile_phone"}
         return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.original_name
+
+
+class BusinessPhone(models.Model):
+    class PermissionStatus(models.TextChoices):
+        UNKNOWN = "unknown", "نامشخص"
+        PUBLIC_BUSINESS_CONTACT = "public_business_contact", "اطلاعات تماس عمومی کسب‌وکار"
+        MARKETING_PERMISSION_CONFIRMED = "marketing_permission_confirmed", "مجوز بازاریابی تأییدشده"
+        OPTED_OUT = "opted_out", "انصراف داده"
+        SUPPRESSED = "suppressed", "مسدود از تماس"
+
+    business_lead = models.ForeignKey(BusinessLead, on_delete=models.CASCADE, related_name="business_phones")
+    normalized_number = models.CharField(max_length=16, db_index=True)
+    permission_status = models.CharField(max_length=40, choices=PermissionStatus.choices, default=PermissionStatus.UNKNOWN)
+    permission_evidence = models.TextField(blank=True)
+    permission_confirmed_at = models.DateTimeField(null=True, blank=True)
+    first_seen_at = models.DateTimeField(default=timezone.now)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["normalized_number"]
+        constraints = [models.UniqueConstraint(fields=["business_lead", "normalized_number"], name="uniq_lead_business_phone")]
+        indexes = [models.Index(fields=["business_lead", "permission_status"])]
+
+    def save(self, *args, **kwargs):
+        normalized = normalize_iranian_mobile(self.normalized_number)
+        if not normalized:
+            raise ValueError("BusinessPhone only stores structurally valid Iranian mobile numbers.")
+        self.normalized_number = normalized
+        if self.permission_status == self.PermissionStatus.MARKETING_PERMISSION_CONFIRMED:
+            if not self.permission_evidence.strip():
+                raise ValueError("Marketing permission requires auditable evidence.")
+            self.permission_confirmed_at = self.permission_confirmed_at or timezone.now()
+        return super().save(*args, **kwargs)
+
+
+class BusinessPhoneEvidence(models.Model):
+    class MatchStatus(models.TextChoices):
+        SOURCE_RECORD = "source_record", "متصل به رکورد کسب‌وکار منبع"
+        SOURCE_CONTACT_FIELD = "source_contact_field", "در فیلد تماس منبع"
+        OFFICIAL_WEBSITE = "official_website", "وب‌سایت کسب‌وکار"
+        SEARCH_RESULT = "search_result", "نتیجهٔ جست‌وجوی تکمیلی"
+        UNVERIFIED = "unverified", "ارتباط تأییدنشده"
+
+    business_phone = models.ForeignKey(BusinessPhone, on_delete=models.CASCADE, related_name="evidence")
+    raw_value = models.CharField(max_length=160)
+    source_name = models.CharField(max_length=40)
+    source_record_id = models.CharField(max_length=255, blank=True)
+    source_url = models.URLField(max_length=1000, blank=True)
+    field_path = models.CharField(max_length=512, blank=True)
+    collected_at = models.DateTimeField(default=timezone.now)
+    phone_type = models.CharField(max_length=24, default="iranian_mobile")
+    validation_status = models.CharField(max_length=40, default="structurally_valid_unverified")
+    confidence_score = models.FloatField(default=0.0)
+    business_match_status = models.CharField(max_length=32, choices=MatchStatus.choices, default=MatchStatus.UNVERIFIED)
+    extraction_method = models.CharField(max_length=40, default="mcp_recursive_extractor")
+
+    class Meta:
+        ordering = ["collected_at", "id"]
+        constraints = [models.UniqueConstraint(
+            fields=["business_phone", "source_name", "source_record_id", "field_path", "raw_value"],
+            name="uniq_phone_evidence_location",
+        )]
+        indexes = [models.Index(fields=["source_name", "collected_at"])]
+
+
+class SuppressedPhone(models.Model):
+    normalized_number = models.CharField(max_length=16, unique=True)
+    reason = models.CharField(max_length=200, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["normalized_number"]
+
+    def save(self, *args, **kwargs):
+        normalized = normalize_iranian_mobile(self.normalized_number)
+        if not normalized:
+            raise ValueError("SuppressedPhone only stores structurally valid Iranian mobile numbers.")
+        self.normalized_number = normalized
+        result = super().save(*args, **kwargs)
+        BusinessPhone.objects.filter(normalized_number=normalized).update(
+            permission_status=BusinessPhone.PermissionStatus.SUPPRESSED,
+        )
+        return result
 
 
 class LeadEvidence(models.Model):
@@ -200,6 +287,8 @@ class LeadEvidence(models.Model):
     extraction_method = models.CharField(max_length=40, default="mcp_tool_response")
     collected_at = models.DateTimeField(default=timezone.now)
     raw_response = models.JSONField(default=dict, blank=True)
+    raw_response_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    raw_response_purged_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["collected_at", "field_name"]
