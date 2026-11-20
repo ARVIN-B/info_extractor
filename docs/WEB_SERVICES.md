@@ -43,9 +43,9 @@ endpointهای مورد انتظار برنامه `POST /v2/crawl` و `GET /v2/c
 
 ```dotenv
 FIRECRAWL_BASE_URL=http://127.0.0.1:3002
-WEB_CRAWL_MAX_PAGES_PER_DOMAIN=5
+WEB_CRAWL_MAX_PAGES_PER_DOMAIN=8
 WEB_CRAWL_MAX_DEPTH=2
-WEB_CRAWL_CONCURRENCY=3
+WEB_CRAWL_CONCURRENCY=1
 WEB_CRAWL_TIMEOUT=60
 ```
 
@@ -72,3 +72,8 @@ curl -X POST 'http://127.0.0.1:3002/v2/crawl' -H 'Content-Type: application/json
 - [SearXNG Search API](https://docs.searxng.org/dev/search_api.html)
 - [Firecrawl self-hosting](https://docs.firecrawl.dev/contributing/self-host)
 - [Firecrawl Crawl API](https://docs.firecrawl.dev/api-reference/endpoint/crawl)
+# عیب‌یابی خطای اتصال وب
+
+در خطای اتصال، صفحهٔ Job حالا نام سرویس، میزبان/درگاه تنظیم‌شده و نوع خطای شبکه یا کد HTTP را نشان می‌دهد؛ مسیر، query string و کلیدها در پیام خطا ثبت نمی‌شوند. اگر برنامه و worker داخل container هستند، `127.0.0.1` به همان container اشاره می‌کند؛ آدرس سرویس SearXNG و Firecrawl باید از شبکهٔ worker قابل دسترسی باشد. خطای `502` از SearXNG را در خود سرویس یا reverse proxy آن بررسی کنید و Firecrawl را از همان محیط worker با `GET /` یا endpoint health بررسی کنید.
+
+`request_count` برای lane وب شامل یک درخواست جست‌وجوی SearXNG و هر درخواست شروع/poll Firecrawl است. یک crawl می‌تواند حداکثر ۸ صفحه را برگرداند؛ افزایش تعداد صفحه‌ها ممکن است به درخواست‌های poll بیشتر و اجرای طولانی‌تر منجر شود. مقدار هدف تماس، crawl دامنه‌های جدید را متوقف می‌کند.

@@ -212,6 +212,7 @@ def _field_values(search_record, detail):
     detail_links = detail.get("links") if isinstance(detail.get("links"), dict) else {}
     search_links = search_record.get("links") if isinstance(search_record.get("links"), dict) else {}
     website = website or _first(detail_links, "website", "official_website", "web") or _first(search_links, "website", "official_website", "web")
+    description = _first(detail, "description", "business_description", "about", "summary", "maintext", "snippet", "bio") or _first(search_record, "description", "business_description", "about", "summary", "maintext", "snippet", "bio")
     phones = list(dict.fromkeys(candidate.raw_value for candidate in mobile_candidates))
     emails = _format_phone_values(_first(detail, "emails", "email", "contact_email"))
     emails += _format_phone_values(_first(search_record, "emails", "email", "contact_email"))
@@ -237,6 +238,7 @@ def _field_values(search_record, detail):
         "emails": emails,
         "social_urls": socials,
         "website": str(website or "").strip(),
+        "description": str(description or "").strip(),
         "national_id": str(_first(detail, "national_id", "national_code", "nationalId", "company_id") or _first(search_record, "national_id", "national_code", "nationalId", "company_id") or "").strip(),
         "business_type": str(_first(detail, "business_type", "company_type", "kind") or _first(search_record, "business_type", "company_type", "kind") or "").strip(),
         "profile_url": normalize_website(_first(detail, "profile_url", "source_url", "url") or _first(search_record, "profile_url", "source_url", "url") or "")[0],
@@ -537,7 +539,11 @@ def save_lead(job, source, search_record, detail, return_created=False):
             JobContact.objects.get_or_create(
                 search_job=contact_job,
                 normalized_number="0" + normalized[3:],
-                defaults={"source_name": source, "address": fields["address"], "evidence_url": source_url},
+                defaults={
+                    "source_name": source, "business_name": fields["name"][:255],
+                    "website": website, "address": fields["address"],
+                    "description": fields["description"][:5000], "evidence_url": source_url,
+                },
             )
         permission = (
             BusinessPhone.PermissionStatus.PUBLIC_BUSINESS_CONTACT if candidate.contact_context

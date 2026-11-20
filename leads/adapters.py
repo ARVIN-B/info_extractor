@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from django.conf import settings
 
 from .mcp_client import MCPSourceError
+from .normalization import extract_iranian_mobiles
 
 
 @dataclass
@@ -199,54 +200,52 @@ def client_source_tool(client, source_id, role):
 
 class EmallsAdapter(SourceAdapter):
     source_id = "emalls"
-    mode = "product_offers_to_shop_profiles"
+    mode = "direct_shop_search_with_bounded_detail"
 
     async def discover(self, client, invoke, query, city, province, limit, start_page=1):
         tools = client_source_tool
-        search_name = tools(client, self.source_id, "search")
+        search_name = tools(client, self.source_id, "shops")
         found = []
         seen_shops = set()
-        page_size = min(10, max(1, limit))
-        max_pages = _max_pages(client, search_name, limit, page_size)
+        max_pages = _max_pages(client, search_name, limit, 48)
         truncated = False
         try:
             end_page = min(max_pages, start_page + settings.SEARCH_PAGES_PER_BATCH - 1)
             for page in range(start_page, end_page + 1):
-                search_response = (await invoke(client, search_name, self._search_args(client, query, city, province, page_size, page=page))).data
-                products = _records(search_response)
-                for product in products:
-                    product_id = _first(product, "id", "product_id", "productId")
-                    if not product_id:
+                search_args = _arguments(client, search_name, {"query": query, "page": page})
+                search_response = (await invoke(client, search_name, search_args)).data
+                shops = _records(search_response)
+                for shop in shops:
+                    shop_id = _first(shop, "shop_id", "shopId", "id")
+                    if not shop_id or str(shop_id) in seen_shops:
                         continue
-                    offers_name = tools(client, self.source_id, "offers")
-                    offers_args = _arguments(client, offers_name, {"product_id": str(product_id), "city": city})
-                    offers_response = (await invoke(client, offers_name, offers_args)).data
-                    offers = _records(offers_response)
-                    for offer in offers:
-                        shop_id = _first(offer, "shop_id", "shopId", "id")
-                        if not shop_id or str(shop_id) in seen_shops:
-                            continue
-                        seen_shops.add(str(shop_id))
+                    seen_shops.add(str(shop_id))
+                    record = dict(shop)
+                    record["_source_id"] = str(shop_id)
+                    record["_source_city"] = _first(shop, "city") or city
+                    record["_source_province"] = _first(shop, "province") or province
+                    record["_source_raw"] = {"shops_response": search_response, "shop": shop}
+                    record["_phone_extraction_payload"] = {"shop": shop}
+                    # Shop search can already return full contact data. Spend a detail call only
+                    # when it did not provide a mobile, keeping the total MCP budget bounded.
+                    profile = {}
+                    if not extract_iranian_mobiles(record["_phone_extraction_payload"]):
                         profile_name = tools(client, self.source_id, "detail")
-                        profile_args = _arguments(client, profile_name, {"shop_id": str(shop_id)})
+                        profile_args = _arguments(client, profile_name, {"shop_id": int(shop_id) if str(shop_id).isdigit() else str(shop_id)})
                         profile = (await invoke(client, profile_name, profile_args)).data
-                        record = dict(offer)
-                        record["name"] = _first(profile if isinstance(profile, dict) else {}, "name", "shop_name", "title") or _first(offer, "shop_name", "shop", "merchant") or _first(product, "shop_name")
-                        record["_source_id"] = str(shop_id)
-                        record["_source_city"] = _first(profile if isinstance(profile, dict) else {}, "city") or _first(offer, "city") or city
-                        record["_source_province"] = _first(profile if isinstance(profile, dict) else {}, "province") or _first(offer, "province") or province
                         profile_payload = profile if isinstance(profile, (dict, list)) else {"value": profile}
-                        scoped = [offer, *_seller_scoped_payload([product, profile_payload], shop_id)]
-                        record["_source_raw"] = {
-                            "search_response": search_response, "product": product,
-                            "offers_response": offers_response, "seller_offer": offer,
-                            "seller_profile_response": profile_payload,
-                        }
-                        record["_phone_extraction_payload"] = {"seller": scoped}
-                        found.append((record, profile))
-                        if len(found) >= limit:
-                            return AdapterResult(found, True)
-                if len(products) < page_size:
+                        record["_source_raw"]["shop_profile"] = profile_payload
+                        record["_phone_extraction_payload"] = {"shop": shop, "profile": profile_payload}
+                    profile_data = profile if isinstance(profile, dict) else {}
+                    record["name"] = _first(profile_data, "name", "shop_name", "title") or _first(shop, "name", "shop_name", "title")
+                    # Provider profile URLs are provenance, never the store's own website.
+                    record["website"] = _first(profile_data, "website", "business_website", "official_website", "web") or _first(shop, "website", "business_website", "official_website", "web")
+                    record["_source_city"] = _first(profile_data, "city") or record["_source_city"]
+                    record["_source_province"] = _first(profile_data, "province") or record["_source_province"]
+                    found.append((record, profile))
+                    if len(found) >= limit:
+                        return AdapterResult(found, True)
+                if len(shops) < 48:
                     break
                 if page == max_pages:
                     truncated = True
@@ -254,7 +253,7 @@ class EmallsAdapter(SourceAdapter):
             exc.partial_records = found
             exc.truncated = truncated
             raise
-        next_page = page + 1 if page == end_page and page < max_pages and len(products) >= page_size else None
+        next_page = page + 1 if page == end_page and page < max_pages and len(shops) >= 48 else None
         return AdapterResult(found, bool(next_page) or truncated, next_page)
 
 

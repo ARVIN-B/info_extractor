@@ -142,9 +142,17 @@ def _contact_payload(job):
     labels = {"neshan": "نشان", "balad": "بلد", "emalls": "ایمالز", "web": "وب"}
     results = []
     for contact in job.contacts.all():
-        row = {"mobile": contact.normalized_number, "source": labels.get(contact.source_name, contact.source_name)}
+        row = {
+            "name": contact.business_name,
+            "mobile": contact.normalized_number,
+            "source": labels.get(contact.source_name, contact.source_name),
+        }
+        if contact.website:
+            row["website"] = contact.website
         if contact.address:
             row["address"] = contact.address
+        if contact.description:
+            row["description"] = contact.description
         results.append(row)
     return results
 
@@ -169,18 +177,17 @@ def export_excel(request, job_id):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "شماره‌های تماس"
-    sheet.append(["شماره موبایل", "منبع", "نشانی"])
+    sheet.append(["نام کسب‌وکار", "شماره موبایل", "منبع", "وب‌سایت", "نشانی", "توضیحات"])
     for contact, row in zip(job.contacts.all(), _contact_payload(job)):
-        sheet.append([_excel_safe(row["mobile"]), _excel_safe(row["source"]), _excel_safe(row.get("address", ""))])
+        sheet.append([_excel_safe(row.get("name", "")), _excel_safe(row["mobile"]), _excel_safe(row["source"]), _excel_safe(row.get("website", "")), _excel_safe(row.get("address", "")), _excel_safe(row.get("description", ""))])
     for cell in sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="153C35")
         cell.alignment = Alignment(horizontal="center")
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    sheet.column_dimensions["A"].width = 22
-    sheet.column_dimensions["B"].width = 18
-    sheet.column_dimensions["C"].width = 60
+    for column, width in {"A": 32, "B": 22, "C": 18, "D": 42, "E": 60, "F": 70}.items():
+        sheet.column_dimensions[column].width = width
     output = BytesIO()
     workbook.save(output)
     response = HttpResponse(output.getvalue(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

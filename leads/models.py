@@ -98,7 +98,7 @@ class JobContactManager(models.Manager):
         contact, created = super().get_or_create(defaults=defaults, **self._normalize_lookup(kwargs))
         if not created and defaults:
             changed = []
-            for field in ("address", "evidence_url"):
+            for field in ("business_name", "website", "description", "address", "evidence_url"):
                 if not getattr(contact, field) and defaults.get(field):
                     setattr(contact, field, defaults[field])
                     changed.append(field)
@@ -120,7 +120,10 @@ class JobContact(models.Model):
     search_job = models.ForeignKey(SearchJob, on_delete=models.CASCADE, related_name="contacts")
     normalized_number = models.CharField(max_length=11)
     source_name = models.CharField(max_length=40)
+    business_name = models.CharField(max_length=255, blank=True)
+    website = models.URLField(max_length=500, blank=True)
     address = models.TextField(blank=True)
+    description = models.TextField(blank=True)
     evidence_url = models.URLField(max_length=1000, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
 
