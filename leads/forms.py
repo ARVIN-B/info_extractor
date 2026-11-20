@@ -3,7 +3,6 @@ from django.conf import settings
 
 from .models import SearchJob
 from .normalization import normalize_text
-from .mcp_client import SOURCE_REGISTRY
 from .sources import canonical_scope_name
 
 
@@ -11,8 +10,12 @@ class SearchJobForm(forms.Form):
     trade_name = forms.CharField(label="صنف یا حوزهٔ کسب‌وکار", max_length=120, min_length=2)
     geographic_scope_type = forms.ChoiceField(label="محدوده", choices=SearchJob.ScopeType.choices)
     geographic_scope_name = forms.CharField(label="شهر یا استان", max_length=120, required=False)
-    sources = forms.MultipleChoiceField(label="منابع", choices=[(key, key.title()) for key in SOURCE_REGISTRY if key in settings.ENABLED_MCP_SOURCES], widget=forms.CheckboxSelectMultiple)
-    max_results = forms.IntegerField(label="حداکثر نتیجه", min_value=1, max_value=settings.SEARCH_MAX_RESULTS, initial=100)
+    requested_phone_count = forms.IntegerField(
+        label="چند شمارهٔ موبایل می‌خواهید؟",
+        min_value=1,
+        max_value=settings.SEARCH_MAX_CONTACTS,
+        initial=min(100, settings.SEARCH_MAX_CONTACTS),
+    )
 
     def clean_trade_name(self):
         value = " ".join(self.cleaned_data["trade_name"].split())
@@ -25,7 +28,7 @@ class SearchJobForm(forms.Form):
         scope_type = cleaned.get("geographic_scope_type")
         scope_name = " ".join((cleaned.get("geographic_scope_name") or "").split())
         if scope_type in {SearchJob.ScopeType.CITY, SearchJob.ScopeType.PROVINCE} and not scope_name:
-            self.add_error("geographic_scope_name", "برای جست‌وجوی شهر یا استان نام محدوده را وارد کنید.")
+            self.add_error("geographic_scope_name", "برای جست‌وجوی شهر یا استان، نام محدوده را وارد کنید.")
         if scope_type == SearchJob.ScopeType.IRAN:
             cleaned["geographic_scope_name"] = "ایران"
         elif scope_name:

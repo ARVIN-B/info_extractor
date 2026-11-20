@@ -5,5 +5,6 @@ jsonschema==4.26.0
 redis==8.1.0
 neshan-mcp==0.2.0
 balad-mcp==0.2.0
+emalls-ir-mcp==0.2.0
 openpyxl==3.1.5
 waitress==3.0.2

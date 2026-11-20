@@ -14,9 +14,9 @@ from django.db import transaction
 from django.utils import timezone
 from redis import Redis
 
-from .adapters import SOURCE_ADAPTERS, _records as _adapter_records
+from .adapters import SOURCE_ADAPTERS, _records as _adapter_records, _with_phone_filter
 from .mcp_client import MCPBudgetExhausted, MCPSourceError, SOURCE_REGISTRY, source_session
-from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
+from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, JobContact, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
 from .normalization import extract_iranian_mobiles, has_iranian_mobile, normalize_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 class SearchCancelled(Exception):
     """Stop collecting safely after the user cancels a job."""
+
+
+class SearchTargetReached(Exception):
+    """Stop this source cleanly after the requested unique-phone count is met."""
 
 # Neshan documents these 23 city centers as valid `near` points.
 CITY_CENTERS = {
@@ -528,6 +532,13 @@ def save_lead(job, source, search_record, detail, return_created=False):
         normalized = normalize_iranian_mobile(candidate.raw_value)
         if not normalized:
             continue
+        contact_job = SearchJob.objects.select_for_update().get(pk=job.pk)
+        if contact_job.contacts.count() < contact_job.requested_phone_count:
+            JobContact.objects.get_or_create(
+                search_job=contact_job,
+                normalized_number="0" + normalized[3:],
+                defaults={"source_name": source, "address": fields["address"], "evidence_url": source_url},
+            )
         permission = (
             BusinessPhone.PermissionStatus.PUBLIC_BUSINESS_CONTACT if candidate.contact_context
             else BusinessPhone.PermissionStatus.UNKNOWN
@@ -626,9 +637,9 @@ def save_lead(job, source, search_record, detail, return_created=False):
             "source_url": source_url, "raw_response": raw,
                 "raw_response_expires_at": raw_expires_at,
                 "normalized_value": json.dumps(normalized_value, ensure_ascii=False) if isinstance(normalized_value, (list, dict)) else str(normalized_value),
-                "confidence_score": 0.8 if source in {"neshan", "balad", "emalls", "rasmio"} else 0.6,
+                "confidence_score": 0.8 if source in {"neshan", "balad", "emalls"} else 0.6,
                 "validation_status": validation_status,
-                "data_type": "public_business_contact" if field_name in {"phone_numbers", "emails", "website"} else ("company_registry" if source == "rasmio" else "public_business_data"),
+                "data_type": "public_business_contact" if field_name in {"phone_numbers", "emails", "website"} else "public_business_data",
             },
         )
     LeadEvidence.objects.get_or_create(
@@ -729,8 +740,6 @@ def get_source_query_variants(trade_name, source, expansion=None):
     """Add source-specific nearby searches instead of excluding a catalog source."""
     query = normalize_text(trade_name)
     online = any(term in query for term in ("فروشگاه اینترنتی", "فروشگاه آنلاین", "آنلاین", "اینترنتی", "مارکت پلیس"))
-    small_market = any(term in query for term in ("باسلام", "صنایع دستی", "خانگی", "دست ساز", "محصولات محلی"))
-    company = any(term in query for term in ("شرکت", "سهامی", "حقوقی", "ثبت شده", "نرم افزار", "فناوری", "صنعتی", "تولیدی", "کارخانه"))
     expanded = expansion or {}
     variants = [trade_name]
     category = expanded.get("category")
@@ -739,12 +748,6 @@ def get_source_query_variants(trade_name, source, expansion=None):
     variants.extend(get_trade_variants(trade_name))
     if source == "emalls" and not online:
         variants.extend(f"فروشگاه {item}" for item in variants[:2])
-    elif source == "basalam" and not (online or small_market):
-        variants.extend(f"محصولات {item}" for item in variants[:2])
-    elif source == "rasmio" and not company:
-        variants.extend(f"شرکت {item}" for item in variants[:2])
-    elif source in {"iran_jobs", "quera"} and not company:
-        variants.extend(f"شرکت {item}" for item in variants[:2])
     variants.extend(item.get("query", "") for item in expanded.get("variants", []) if isinstance(item, dict))
     maximum = max(1, settings.SEARCH_QUERY_MAX_VARIANTS + 1)
     return list(dict.fromkeys(item.strip() for item in variants if item.strip()))[:maximum]
@@ -757,7 +760,7 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
     processed_ids = set()
     checkpoint = dict(execution.checkpoint or {})
     variant_index = max(0, int(checkpoint.get("variant_index", 0)))
-    start_page = int(checkpoint.get("page", 0 if source == "torob" else 1))
+    start_page = int(checkpoint.get("page", 1))
     record_offset = max(0, int(checkpoint.get("record_offset", 0)))
     for index in range(variant_index, len(variants)):
         variant = variants[index]
@@ -771,8 +774,8 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
         try:
             discovery = await adapter.discover(
                 client=client, invoke=invoke, query=variant, city=city, province=province,
-                limit=job.max_results,
-                start_page=start_page if index == variant_index else (0 if source == "torob" else 1),
+                limit=job.requested_phone_count,
+                start_page=start_page if index == variant_index else 1,
             )
             candidates = discovery.records
             execution.truncated = execution.truncated or (discovery.truncated and discovery.next_page is None)
@@ -788,7 +791,7 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
                 execution.error_details = str(exc)[:2000]
             else:
                 errors.append(str(exc))
-        current_page = start_page if index == variant_index else (0 if source == "torob" else 1)
+        current_page = start_page if index == variant_index else 1
         page_fingerprint = _catalog_page_fingerprint(candidates)
         prior_fingerprints = checkpoint.get("page_fingerprints", []) if index == variant_index else []
         repeated_page = _is_repeated_catalog_page(page_fingerprint, prior_fingerprints, current_page)
@@ -799,6 +802,8 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
             candidates_to_save = candidates
         resume_offset = None
         for record_index, (record, detail) in enumerate(candidates_to_save):
+            if await sync_to_async(lambda: job.contacts.count() >= job.requested_phone_count, thread_sensitive=True)():
+                break
             if index == variant_index and record_index < record_offset:
                 continue
             if saved >= source_budget:
@@ -813,12 +818,6 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
                 processed_ids.add(stable_id)
             actual_city = str(record.get("_source_city") or "").strip()
             actual_province = str(record.get("_source_province") or "").strip()
-            if source == "basalam" and city and normalize_text(actual_city) != normalize_text(city):
-                continue
-            if source == "basalam" and province:
-                found_province = actual_province or CITY_PROVINCE.get(actual_city, "")
-                if normalize_text(found_province) != normalize_text(province):
-                    continue
             record["_searched_city"] = actual_city or city or province
             if record.get("_source_id"):
                 record.setdefault("id", record["_source_id"])
@@ -855,7 +854,7 @@ async def _search_catalog_source(source, job, execution, adapter, client, invoke
             execution.completed_at = None
             await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint", "status", "completed_at"])
             return saved
-        execution.checkpoint = {"kind": "catalog", "variant_index": index + 1, "page": 0 if source == "torob" else 1, "record_offset": 0}
+        execution.checkpoint = {"kind": "catalog", "variant_index": index + 1, "page": 1, "record_offset": 0}
         await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["checkpoint"])
         if errors or saved >= source_budget:
             if saved >= source_budget:
@@ -894,8 +893,8 @@ async def _search_source(source, job, execution):
     
     variants = get_source_query_variants(job.trade_name, source, getattr(job, "query_expansion", {}))
     scope_points = get_scope_points(job)
-    remaining = max(0, job.max_results - await sync_to_async(
-        lambda: job.leads.filter(has_mobile_phone=True).count(), thread_sensitive=True
+    remaining = max(0, job.requested_phone_count - await sync_to_async(
+        lambda: job.contacts.count(), thread_sensitive=True
     )())
     if remaining == 0:
         execution.status = SourceExecution.Status.COMPLETED
@@ -934,6 +933,12 @@ async def _search_source(source, job, execution):
         )()
         if cancelled:
             raise SearchCancelled
+        target_reached = await sync_to_async(
+            lambda: job.contacts.count() >= job.requested_phone_count,
+            thread_sensitive=True,
+        )()
+        if target_reached:
+            raise SearchTargetReached
         job_calls = await sync_to_async(
             lambda: sum(job.source_executions.values_list("request_count", flat=True)), thread_sensitive=True
         )()
@@ -1052,6 +1057,7 @@ async def _search_source(source, job, execution):
                         "radius_km": 20,
                         "limit": min(40, max(1, per_location_budget - location_saved)),
                     }
+                args = _with_phone_filter(client, search_tool, args)
                 if variant not in execution.query_variants:
                     execution.query_variants = [*execution.query_variants, variant]
                     await sync_to_async(execution.save, thread_sensitive=True)(update_fields=["query_variants"])
@@ -1157,6 +1163,11 @@ def execute_source(source, job, execution):
     execution.save(update_fields=["status", "started_at", "last_attempt_at"])
     try:
         return asyncio.run(_search_source(source, job, execution))
+    except SearchTargetReached:
+        execution.status = SourceExecution.Status.COMPLETED
+        execution.completed_at = timezone.now()
+        execution.save(update_fields=["status", "completed_at"])
+        return 0
     except SearchCancelled:
         execution.status = SourceExecution.Status.CANCELLED
         execution.completed_at = timezone.now()

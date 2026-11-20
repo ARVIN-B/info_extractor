@@ -25,6 +25,7 @@ class SearchJob(models.Model):
     geographic_scope_name = models.CharField("نام محدوده", max_length=120, blank=True)
     selected_sources = models.JSONField(default=list)
     max_results = models.PositiveSmallIntegerField(default=100)
+    requested_phone_count = models.PositiveSmallIntegerField(default=100)
     query_expansion = models.JSONField(default=dict, blank=True)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.QUEUED)
     celery_task_id = models.CharField(max_length=255, blank=True)
@@ -79,6 +80,66 @@ class SourceExecution(models.Model):
     class Meta:
         constraints = [models.UniqueConstraint(fields=["search_job", "source_name"], name="uniq_job_source")]
         ordering = ["source_name"]
+
+
+class JobContactManager(models.Manager):
+    def _normalize_lookup(self, kwargs):
+        kwargs = dict(kwargs)
+        number = kwargs.get("normalized_number")
+        if number is not None:
+            from .normalization import normalize_phone
+
+            canonical = normalize_phone(number)
+            if canonical:
+                kwargs["normalized_number"] = canonical
+        return kwargs
+
+    def get_or_create(self, defaults=None, **kwargs):
+        contact, created = super().get_or_create(defaults=defaults, **self._normalize_lookup(kwargs))
+        if not created and defaults:
+            changed = []
+            for field in ("address", "evidence_url"):
+                if not getattr(contact, field) and defaults.get(field):
+                    setattr(contact, field, defaults[field])
+                    changed.append(field)
+            if changed:
+                contact.save(update_fields=changed)
+        return contact, created
+
+    def update_or_create(self, defaults=None, create_defaults=None, **kwargs):
+        return super().update_or_create(
+            defaults=defaults,
+            create_defaults=create_defaults,
+            **self._normalize_lookup(kwargs),
+        )
+
+
+class JobContact(models.Model):
+    """One public business mobile per search job; phone is the deduplication key."""
+
+    search_job = models.ForeignKey(SearchJob, on_delete=models.CASCADE, related_name="contacts")
+    normalized_number = models.CharField(max_length=11)
+    source_name = models.CharField(max_length=40)
+    address = models.TextField(blank=True)
+    evidence_url = models.URLField(max_length=1000, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    objects = JobContactManager()
+
+    class Meta:
+        ordering = ["normalized_number"]
+        constraints = [
+            models.UniqueConstraint(fields=["search_job", "normalized_number"], name="uniq_job_contact_phone"),
+        ]
+
+    def save(self, *args, **kwargs):
+        from .normalization import normalize_phone
+
+        number = normalize_phone(self.normalized_number)
+        if len(number) != 11 or not number.startswith("09"):
+            raise ValueError("JobContact requires a valid Iranian mobile number.")
+        self.normalized_number = number
+        return super().save(*args, **kwargs)
 
 
 class SourceToolCall(models.Model):

@@ -85,7 +85,7 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": os.environ.get("DATABASE_PATH", str(BASE_DIR / "db.sqlite3")),
-        "OPTIONS": {"timeout": 20},
+        "OPTIONS": {"timeout": max(5, int(os.environ.get("SQLITE_BUSY_TIMEOUT", "60")))},
     }
 }
 
@@ -158,6 +158,18 @@ CELERY_BEAT_SCHEDULE = {
 }
 
 SOURCE_TIMEOUT_SECONDS = int(os.environ.get("SOURCE_TIMEOUT_SECONDS", "45"))
+SEARCH_MAX_CONTACTS = max(1, min(10000, int(os.environ.get("SEARCH_MAX_CONTACTS", "1000"))))
+SEARXNG_BASE_URL = os.environ.get("SEARXNG_BASE_URL", "").rstrip("/")
+FIRECRAWL_BASE_URL = os.environ.get("FIRECRAWL_BASE_URL", "").rstrip("/")
+FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
+WEB_SEARCH_ENABLED = env_bool("WEB_SEARCH_ENABLED", True)
+WEB_SEARCH_MAX_RESULTS = max(1, min(100, int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "30"))))
+WEB_SEARCH_MAX_DOMAINS = max(1, min(30, int(os.environ.get("WEB_SEARCH_MAX_DOMAINS", "8"))))
+WEB_CRAWL_MAX_PAGES_PER_DOMAIN = max(1, min(20, int(os.environ.get("WEB_CRAWL_MAX_PAGES_PER_DOMAIN", "5"))))
+WEB_CRAWL_MAX_DEPTH = max(0, min(5, int(os.environ.get("WEB_CRAWL_MAX_DEPTH", "2"))))
+WEB_CRAWL_TIMEOUT = max(5, min(300, int(os.environ.get("WEB_CRAWL_TIMEOUT", "60"))))
+WEB_SEARCH_TIMEOUT = max(2, min(60, int(os.environ.get("WEB_SEARCH_TIMEOUT", "15"))))
+WEB_CRAWL_CONCURRENCY = max(1, min(8, int(os.environ.get("WEB_CRAWL_CONCURRENCY", "3"))))
 SOURCE_LOCK_WAIT_SECONDS = int(os.environ.get("SOURCE_LOCK_WAIT_SECONDS", "60"))
 SEARCH_MAX_RESULTS = min(32767, max(1, int(os.environ.get("SEARCH_MAX_RESULTS", "5000"))))
 SEARCH_MAX_PAGES_PER_SOURCE = max(1, int(os.environ.get("SEARCH_MAX_PAGES_PER_SOURCE", "500")))
@@ -190,8 +202,6 @@ SOURCE_RATE_LIMIT_JITTER = float(os.environ.get("SOURCE_RATE_LIMIT_JITTER", "1")
 SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS = int(os.environ.get("SOURCE_RATE_LIMIT_LONG_THRESHOLD_SECONDS", "3600"))
 SOURCE_DAILY_QUOTA_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_DAILY_QUOTA_COOLDOWN_SECONDS", "86400"))
 SOURCE_MONTHLY_QUOTA_COOLDOWN_SECONDS = int(os.environ.get("SOURCE_MONTHLY_QUOTA_COOLDOWN_SECONDS", "2592000"))
-SOURCE_FALLBACK_ENABLED = env_bool("SOURCE_FALLBACK_ENABLED", True)
-SOURCE_FALLBACK_MAX_DEPTH = int(os.environ.get("SOURCE_FALLBACK_MAX_DEPTH", "4"))
 BALAD_DETAIL_MIN_INTERVAL_SECONDS = float(
     os.environ.get("BALAD_DETAIL_MIN_INTERVAL_SECONDS", "6")
 )
@@ -201,19 +211,9 @@ SOURCE_DETAIL_CACHE_TTL_SECONDS = int(
 MCP_DISTRIBUTED_SOURCE_LIMITS = env_bool("MCP_DISTRIBUTED_SOURCE_LIMITS", not DEBUG)
 ENABLED_MCP_SOURCES = [
     name.strip().lower()
-    for name in os.environ.get("ENABLED_MCP_SOURCES", "neshan,balad,emalls,basalam,rasmio,torob,iran_jobs,quera,digikala,snappshop").split(",")
-    if name.strip().lower() in {"neshan", "balad", "emalls", "basalam", "rasmio", "torob", "iran_jobs", "quera", "digikala", "snappshop"}
+    for name in os.environ.get("ENABLED_MCP_SOURCES", "neshan,balad,emalls").split(",")
+    if name.strip().lower() in {"neshan", "balad", "emalls"}
 ]
-# MCP_BIN_DIR = BASE_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin")
-# MCP_SERVER_PATHS = {
-#     source: str(MCP_BIN_DIR / (f"{executable}.exe" if os.name == "nt" else executable))
-#     for source, executable in {
-#         "neshan": "neshan-mcp", "balad": "balad-mcp", "emalls": "emalls-ir-mcp",
-#         "basalam": "basalam-mcp", "rasmio": "rasmio-mcp",
-#     }.items()
-# }
-
-
 import shutil
 
 MCP_BIN_DIR = BASE_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin")
@@ -249,12 +249,5 @@ MCP_SERVER_PATHS = {
         "neshan": "neshan-mcp",
         "balad": "balad-mcp",
         "emalls": "emalls-ir-mcp",
-        "basalam": "basalam-mcp",
-        "rasmio": "rasmio-mcp",
-        "torob": "torob-mcp",
-        "iran_jobs": "iran-jobs-mcp",
-        "quera": "quera-mcp",
-        "digikala": "digikala-mcp",
-        "snappshop": "snappshop-mcp",
     }.items()
 }

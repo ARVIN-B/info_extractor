@@ -1,55 +1,14 @@
-# ماتریس منابع جست‌وجو
+# منابع فعال
 
-این ماتریس وضعیت این checkout را از قابلیت‌های معرفی‌شده در catalog/repositoryهای MCP جدا می‌کند. هیچ source صرفاً به دلیل وجود در iran-mcp فعال نمی‌شود.
+برای هر جست‌وجو سه MCP نقشه/فروشگاه و یک مسیر مستقل وب با هم اجرا می‌شوند.
 
-| منبع | ابزارهای بررسی‌شده/استفاده‌شده | فیلدهای واقع‌بینانه | پوشش و محدودیت | وضعیت این checkout |
-|---|---|---|---|---|
+| منبع | ابزار/مسیر | شیوهٔ جست‌وجو و شماره |
+|---|---|---|
+| نشان | `ns_search` سپس `ns_place` | شمارهٔ خروجی جست‌وجو و جزئیات مکان؛ schema فعلی فیلتر تلفن ندارد و شناسهٔ واقعی نتیجه برای جزئیات استفاده می‌شود. |
+| بلد | `bl_nearby`/`bl_search` و در صورت نیاز `bl_place` | `bl_nearby` schema فعلی `with_phone` دارد و با مقدار `true` فراخوانی می‌شود؛ تلفن نتیجه/جزئیات هم استخراج می‌شود. |
+| ایمالز | `em_search` → `em_offers` → `em_shop` | schema فعلی `em_search` فیلتر تلفن ندارد؛ شمارهٔ پروفایل فروشگاه استخراج می‌شود و در نبود تماس، نتیجه ساخته نمی‌شود. |
+| وب | SearXNG `/search?format=json` → Firecrawl `/v2/crawl` | یافتن دامنه و crawl محدود صفحات اصلی، تماس، درباره و شعب؛ Regex موبایل فقط روی محتوای عمومی اجرا می‌شود. |
 
-| Neshan | `ns_search`, `ns_place` | نام، دسته، موقعیت، نشانی و تماس اگر خروجی عمومی بدهد؛ سایت فقط از فیلد صریح وب‌سایت | POI نقشه، سقف ابزار و محدودیت جغرافیایی؛ `ns_place` می‌تواند 429 بدهد | فعال؛ cooldown پایدار؛ live job در ۲۰۲۶-۱۱-۱۱ تعداد ۳۰ نتیجهٔ خام گرفت و سپس جزئیات با 429 محدود شد |
-| Balad | `bl_nearby`, `bl_search`, `bl_place` | نام، دسته، نشانی، موقعیت و تماس اگر ارائه شود؛ سایت فقط از فیلد صریح وب‌سایت | POI نقشه؛ جست‌وجوی صنف با nearby؛ جغرافیا/تعداد نتیجه محدود | فعال؛ در live job نمونه ۲۰ نتیجهٔ خام برگشت |
-| Emalls | `em_search` → `em_offers` → `em_shop`; `em_shops` برای resolve نام فروشگاه | نام فروشگاه، تلفن/نشانی/وب‌سایت فقط اگر پروفایل ارائه کند | فروشنده‌های حاضر در مقایسه‌گر قیمت؛ جست‌وجو از محصول به offer فروشگاه می‌رسد، بانک کامل اصناف نیست | فعال؛ package در `.venv` و schema زنده تأیید؛ smoke جست‌وجو موفق |
-| Basalam | `bs_search` → `bs_vendor` | نام غرفه، شهر/فعالیت/روش ارسال و اطلاعات عمومی پروفایل؛ تلفن فقط اگر صریحاً برگردد | هر نتیجه از محصول به غرفه می‌رسد؛ غرفه معادل مغازهٔ فیزیکی نیست | فعال؛ package در `.venv` و schema زنده تأیید؛ smoke جست‌وجو موفق؛ شهر غرفه فیلتر می‌شود |
-| Rasmio | `rs_search_companies`; `rs_company` عمداً فراخوانی خودکار نمی‌شود | شناسه ملی، نام، خلاصه فعالیت و هر فیلد عمومی موجود در نتایج جست‌وجو | فهرست ثبتی شرکت‌ها؛ پروندهٔ مهمان سهمیهٔ محدود دارد؛ تلفن اشخاص ارائه نمی‌شود | فعال فقط برای search؛ package و schema زنده تأیید؛ smoke موفق؛ برای تماس مستقیم منبع اصلی نیست |
-| Torob | `tb_find_shops` | نام فروشگاه، شناسه و اطلاعات عمومی در صورت ارائه | جست‌وجوی مستقیم فروشگاه؛ تماس عمومی تضمین نمی‌شود؛ باید schema همان سرور بررسی شود | فعال؛ در نسخهٔ تولیدی `torob-mcp==0.2.2`، جست‌وجو از adapter واقعی استفاده می‌کند |
-| Digikala | `dk_search` → `dk_product` | فروشنده/شناسهٔ فروشنده و اطلاعاتی که بازارگاه منتشر کند | فروشنده‌های محصولات جست‌وجوشده؛ وب‌سایت رسمی کسب‌وکار تضمین نمی‌شود | فعال؛ نسخهٔ تثبیت‌شده `digikala-mcp==0.6.2` |
-| Iran Jobs | `job_companies` | نام شرکت و شواهد کارفرما/وب‌سایت در صورت ارائه | جست‌وجوی شرکت در IranTalent، Jobinja و Jobvision؛ تلفن عمومی تضمین نمی‌شود | فعال؛ نسخهٔ تولیدی `iran-jobs-mcp==0.2.1`؛ `name` از query داخلی بر اساس schema مپ می‌شود |
-| SnappShop | `ss_search` → `ss_product` | فروشنده/شناسهٔ فروشنده و اطلاعاتی که بازارگاه منتشر کند | فروشنده‌های محصولات جست‌وجوشده؛ ممکن است به خروجی شبکهٔ ایران نیاز داشته باشد | فعال؛ نسخهٔ تثبیت‌شده `snappshop-mcp==0.2.1` |
-| Divar و Sheypoor | ابزارهای آگهی و جست‌وجوی آگهی | عنوان/دسته/شهر به‌عنوان lead، فقط اگر دادهٔ عمومی و مجاز باشد | شمارهٔ شخصی فروشنده/آگهی‌دهنده خارج از محدوده است؛ آگهی اثبات کسب‌وکار مستقل نیست | غیرفعال؛ هیچ تماس شخصی استخراج نمی‌شود |
-| Snappfood، TapsiFood، Okala | ابزارهای فروشگاه/رستوران و محدودهٔ تحویل | نام فروشنده و دادهٔ سرویس/نشانی در صورت ارائه | محدودهٔ تحویل پلتفرم است، نه فهرست همهٔ رستوران‌ها/فروشگاه‌ها؛ تلفن عمومی تضمین نمی‌شود | غیرفعال؛ adapter صنفی فقط پس از بررسی schema و coverage |
-| Paziresh24، Doctoreto، ExirYab | جست‌وجوی پزشک/مرکز درمانی | پروفایل حرفه‌ای و اطلاعات تماس عمومی در صورت ارائه | فقط حوزه سلامت؛ نتیجهٔ پزشک با کسب‌وکار عمومی یکی نیست | غیرفعال؛ نیازمند adapter/تست مستقل حوزه سلامت |
-| OpenStreetMap/Overpass | API عمومی OSM | تگ‌های POI، نام، نشانی و contact tags در صورت ثبت | کیفیت/تازگی داده ناهمگون؛ attribution و rate limit الزامی؛ query باید کنترل‌شده باشد | در این نسخه پیاده‌سازی نشده؛ پیش از فعال‌سازی policy و attribution جداگانه بررسی شود |
+شمارهٔ خروجی به شکل `09XXXXXXXXX` canonical می‌شود. قید یکتایی `(search_job, normalized_number)` منبع برنده را نگه می‌دارد و duplicate بین laneها را حذف می‌کند. آدرس فقط وقتی یکی از مسیرها منتشر کند در خروجی می‌آید.
 
-## سیاست اجرا
-
-- فهرست `ENABLED_MCP_SOURCES` در `.env` تعیین می‌کند کدام منابع فعال‌اند؛ تنظیم `.env` کاربر دست نخورده می‌ماند. جست‌وجوی `check_mcp --schema-only` فقط اتصال و قرارداد ابزار را می‌سنجد و فراخوانی وب‌سایت انجام نمی‌دهد.
-- جست‌وجوی Emalls و Basalam از محصول به فروشنده می‌رسد؛ خروجی محصول به‌تنهایی به‌عنوان شرکت/مغازه ثبت نمی‌شود.
-- رسمیو فقط جست‌وجوی کم‌هزینهٔ شرکت را انجام می‌دهد؛ عمداً `rs_company` را خودکار صدا نمی‌زند تا سهمیهٔ محدود کاربر مهمان مصرف نشود.
-- خطای 429 در SQLite تا زمان cooldown می‌ماند. منبع در آن بازه `skipped` است؛ خطای source جزئی `partial` است و نتایج جست‌وجوی همان پاسخ حفظ می‌شوند.
-- درخواست‌های `ns_place` حداقل با فاصلهٔ ۶ ثانیه می‌روند و detailهای پاک‌سازی‌شده تا یک روز cache می‌شوند؛ داده‌های cacheشدهٔ قبلی از evidence موجود seed می‌شوند. این کار تماس تکراری و burst را کم می‌کند، اما quota بیرونی را حذف نمی‌کند.
-- queryهای کشور budget دارند؛ جست‌وجوی ۲۳ شهر فعلی نمونه‌برداری است، نه پوشش کامل ایران. سقف call هر source و کل job در `SOURCE_MAX_CALLS_PER_JOB` و `MAX_MCP_CALLS_PER_JOB` کنترل می‌شود؛ query و منطقهٔ بررسی‌شده و truncation در اجرای منبع ثبت می‌شوند.
-- فیلد عمومی `url` در پاسخ نقشه، صفحهٔ خود Neshan/Balad است و وب‌سایت محسوب نمی‌شود؛ برای `BusinessLead.website` فقط کلیدهای صریح `website`/`web`/پیوند سایت کسب‌وکار پذیرفته می‌شوند. شواهد لینک صفحهٔ نقشه را جدا نگه می‌دارند.
-- Jobهای پس‌زمینه به Celery worker نیاز دارند؛ اجرای `runserver` به‌تنهایی jobها را پردازش نمی‌کند. صفحهٔ job پس از یک دقیقه ماندن در صف راه‌اندازی worker را یادآوری می‌کند.
-- برای بازبینی schema بدون فراخوانی وب از `check_mcp --schema-only` استفاده کن؛ smoke قبلی هر منبع محدود بوده و دسترسی/محدودیت سرویس بیرونی ممکن است تغییر کند.
-
-## مراجع اصلی
-
-- [iran-mcp catalog](https://github.com/sepehr071/iran-mcp) و فایل‌های `servers.json`, `TOOLS.md`, `AGENTS.md`
-- [Emalls MCP](https://github.com/sepehr071/emalls-ir-mcp)
-- [Basalam MCP](https://github.com/sepehr071/basalam-mcp)
-- [Rasmio MCP](https://github.com/sepehr071/rasmio-mcp)
-- [Torob MCP](https://github.com/sepehr071/torob-mcp)
-- [Neshan MCP](https://github.com/sepehr071/neshan-mcp)
-
-For Emalls, Basalam, and Rasmio, the planner now tries source-specific nearby query variants instead of marking the source irrelevant and skipping it. The exact attempted phrases are recorded on the source card. Marketplace and registry matches can be related alternatives rather than the same type of storefront; interpret each result using its source and business category.
-
-
-## Update 5 phone extraction and source coverage notes
-
-All configured adapters now preserve their provider-specific raw row where available, and a shared bounded recursive extractor scans nested fields and JSON strings. Results store valid Iranian mobiles in E.164 format and track source, source record, field path, and raw candidate per number. The phone-yield counts shown on each job page come from collected evidence, so a connected/schema-valid source with zero phone evidence is not presented as having found mobiles.
-
-A business profile URL supplied by a map provider remains provenance and is not treated as an official business website. No arbitrary website crawler or search-results scraper is enabled in this update. There is no configured official Search API credential or customer website-crawl allowlist. Review provider terms, quotas, contact-field availability, and any required credentials before enabling additional coverage.
-# Update 6 audit note (2026-11-19)
-
-See [MCP platform response samples](MCP_PLATFORM_RESPONSE_SAMPLES.md) for the live `list_tools()` schemas and bounded, redacted response samples collected from the installed MCP servers. Schema availability is separate from contact yield: a provider is never labeled as incapable based on one sample. Torob's schema was available, but its single live probe timed out; Rasmio's company search succeeded and its guest profile endpoint was intentionally not called because of the profile quota.
-
-Phone extraction now keeps source and field-path evidence, filters account-scoped phone values, and scopes marketplace contacts to a seller identifier match. Per-source execution diagnostics include search/detail record counts, extraction counts, persisted mobile counts, and query-variant business/mobile yield. Apply migration `0014_sourceexecution_diagnostics` before running the updated application.
+هر lane رکورد `SourceExecution` مستقل و خطای مستقل دارد. محدودیت rate upstream با cooldown و حفظ نتایج قبلی مدیریت می‌شود؛ retry بی‌نهایت یا proxy rotation انجام نمی‌شود. نام منابع غیرفعال، connectorها و بسته‌هایشان از runtime و `requirements.txt` حذف شده‌اند.
