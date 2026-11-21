@@ -18,7 +18,13 @@
 
 ## Verification and documentation
 
-- [ ] Add mocked tests for auth, TLS configuration, language, pagination, deduplication, empty/malformed responses, retries, errors, 429 cooldown, and extraction.
-- [ ] Run Django checks, migrations check, and the project test suite with `.venv` Python only.
-- [ ] Run the real provider check if this environment can reach the documented SearXNG server; report the actual result honestly.
-- [ ] Update `.env.example`, provider/service docs, README, and this checklist; do not edit `.env` or install packages.
+- [x] Add mocked tests for auth, TLS configuration, language, pagination, deduplication, empty/malformed responses, retries, errors, 429 cooldown, and extraction.
+- [x] Run Django checks, migrations check, and the project test suite with `.venv` Python only.
+- [x] Run the real provider check if this environment can reach the documented SearXNG server; report the actual result honestly.
+- [x] Update `.env.example`, provider/service docs, README, and this checklist; do not edit `.env` or install packages.
+
+## Production issue follow-up (2026-11-21)
+
+- [x] Preserve strict TLS verification and document remediation for hostname/SAN mismatch and private CA deployment.
+- [x] Enable SQLite WAL and configure a busy timeout; shorten cancellation writes and retry transient lock contention.
+- [x] Run regression tests, Django checks, migration checks, and a live SearXNG check; record certificate limitation and verified cause (self-signed issuer, matching IP SAN).

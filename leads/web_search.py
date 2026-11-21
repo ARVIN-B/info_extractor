@@ -176,8 +176,13 @@ def fetch_searxng_page(query, page=1, *, client=None, request_counter=None):
                     time.sleep(min(0.5 * (attempt + 1), 1.0))
                     continue
                 detail = str(exc).lower()
-                error_name = "TLS certificate verification failed" if "certificate" in detail or "ssl" in detail else type(exc).__name__
-                raise WebServiceError(f"SearXNG connection failed at {_endpoint_label(base)} ({error_name}). Check service reachability and TLS configuration.") from None
+                tls_failure = "certificate" in detail or "ssl" in detail
+                error_name = "TLS certificate verification failed" if tls_failure else type(exc).__name__
+                guidance = (
+                    "Configure SEARXNG_CA_BUNDLE with the issuing CA, or use a hostname that matches the certificate."
+                    if tls_failure else "Check service reachability and TLS configuration."
+                )
+                raise WebServiceError(f"SearXNG connection failed at {_endpoint_label(base)} ({error_name}). {guidance}") from None
             status = response.status_code
             if status == 429:
                 raise WebServiceError(

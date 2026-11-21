@@ -9,6 +9,8 @@ from django.contrib.auth import get_user_model
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from django.db import transaction as db_transaction
+from django.db.utils import OperationalError
 from openpyxl import load_workbook
 from asgiref.sync import async_to_sync
 
@@ -377,6 +379,17 @@ class WebDiscoveryTests(TestCase):
         self.assertIn("SearXNG", execution.error_details)
         self.assertNotIn("secret", execution.error_details)
 
+    def test_tls_error_explains_ca_and_hostname_remedies_without_disabling_verification(self):
+        def fail(_request):
+            raise httpx.ConnectError("certificate verify failed: IP address mismatch")
+        client = httpx.Client(transport=httpx.MockTransport(fail))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_RETRIES=0):
+            with self.assertRaises(WebServiceError) as caught:
+                fetch_searxng_page("query", client=client)
+        client.close()
+        self.assertIn("SEARXNG_CA_BUNDLE", str(caught.exception))
+        self.assertIn("hostname that matches", str(caught.exception))
+
     @override_settings(WEB_SEARCH_ENABLED=True, WEB_CRAWL_MAX_PAGES_PER_DOMAIN=5, WEB_CRAWL_CONCURRENCY=2)
     def test_lane_saves_unique_mobile_contacts_and_stops_at_requested_target(self):
         job = make_job(requested=2, status=SearchJob.Status.RUNNING)
@@ -422,6 +435,42 @@ class WebDiscoveryTests(TestCase):
 
 
 class ParallelJobTests(TransactionTestCase):
+    def test_cancel_job_retries_transient_sqlite_lock(self):
+        job = make_job(status=SearchJob.Status.RUNNING)
+        SourceExecution.objects.create(search_job=job, source_name="web", status=SourceExecution.Status.RUNNING)
+        client = Client()
+        client.force_login(job.owner)
+        real_atomic = db_transaction.atomic
+        with patch("leads.views.transaction.atomic", side_effect=[OperationalError("database is locked"), real_atomic()]):
+            response = client.post(reverse("cancel_job", args=[job.pk]))
+        job.refresh_from_db()
+        execution = SourceExecution.objects.get(search_job=job, source_name="web")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(job.status, SearchJob.Status.CANCELLED)
+        self.assertEqual(execution.status, SourceExecution.Status.CANCELLED)
+
+    def test_cancel_job_updates_active_rows_in_one_short_transaction(self):
+        job = make_job(status=SearchJob.Status.QUEUED)
+        SourceExecution.objects.create(search_job=job, source_name="web")
+        client = Client()
+        client.force_login(job.owner)
+        response = client.post(reverse("cancel_job", args=[job.pk]))
+        job.refresh_from_db()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(job.status, SearchJob.Status.CANCELLED)
+        self.assertEqual(job.source_executions.get(source_name="web").status, SourceExecution.Status.CANCELLED)
+
+    def test_cancel_job_returns_retryable_response_if_sqlite_remains_locked(self):
+        job = make_job(status=SearchJob.Status.RUNNING)
+        client = Client()
+        client.force_login(job.owner)
+        with patch("leads.views.transaction.atomic", side_effect=[OperationalError("database is locked") for _ in range(4)]):
+            response = client.post(reverse("cancel_job", args=[job.pk]))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response["Retry-After"], "2")
+        job.refresh_from_db()
+        self.assertEqual(job.status, SearchJob.Status.RUNNING)
+
     def test_all_four_lanes_start_concurrently_and_source_error_is_isolated(self):
         job = make_job(requested=6)
         SourceExecution.objects.bulk_create([SourceExecution(search_job=job, source_name=name) for name in job.selected_sources])

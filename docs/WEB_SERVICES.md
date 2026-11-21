@@ -81,6 +81,14 @@ curl -X POST 'http://127.0.0.1:3002/v2/crawl' -H 'Content-Type: application/json
 - [SearXNG Search API](https://docs.searxng.org/dev/search_api.html)
 - [Firecrawl self-hosting](https://docs.firecrawl.dev/contributing/self-host)
 - [Firecrawl Crawl API](https://docs.firecrawl.dev/api-reference/endpoint/crawl)
+
+## Production notes: TLS certificates and SQLite cancellation
+
+If `SEARXNG_BASE_URL` uses an IP address such as `https://195.248.240.152:8888`, the certificate must include that IP in its Subject Alternative Name. A certificate issued only to a DNS hostname cannot validate for the IP. Prefer a DNS hostname with a valid certificate and configure that hostname as the base URL. For a private/self-signed CA, place its PEM file where both web and Celery worker can read it, set `SEARXNG_CA_BUNDLE=/app/certs/searxng-ca.pem`, then restart both services. Keep TLS verification enabled in production.
+
+The currently observed certificate at `195.248.240.152:8888` is self-signed (`subject=issuer`) and its SAN contains the IP. That means the hostname matches, but the issuer is not in the worker's trust store. Obtain the PEM certificate/CA through an authenticated server administration channel, verify its SHA-256 fingerprint out of band, deploy the PEM to the app, and set the CA bundle path above. Alternatively, configure a publicly trusted certificate for a domain and switch the base URL to that domain.
+
+SQLite is configured for WAL and a 60-second busy timeout, and job cancellation uses a short conditional update with bounded retries for transient `database is locked` errors. Keep `DATABASE_PATH` on persistent local disk, not a network filesystem. Restart web and workers after deploying. WAL does not remove contention from long or numerous concurrent writes; if lock errors continue, verify the database filesystem and worker logs, and consider PostgreSQL for higher concurrent write load.
 # عیب‌یابی خطای اتصال وب
 
 در خطای اتصال، صفحهٔ Job حالا نام سرویس، میزبان/درگاه تنظیم‌شده و نوع خطای شبکه یا کد HTTP را نشان می‌دهد؛ مسیر، query string و کلیدها در پیام خطا ثبت نمی‌شوند. اگر برنامه و worker داخل container هستند، `127.0.0.1` به همان container اشاره می‌کند؛ آدرس سرویس SearXNG و Firecrawl باید از شبکهٔ worker قابل دسترسی باشد. خطای `502` از SearXNG را در خود سرویس یا reverse proxy آن بررسی کنید و Firecrawl را از همان محیط worker با `GET /` یا endpoint health بررسی کنید.

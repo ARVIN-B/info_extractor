@@ -1,9 +1,11 @@
 import json
+import time
 from io import BytesIO
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.paginator import Paginator
-from django.db import transaction
+from django.db import connections, transaction
+from django.db.utils import OperationalError
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -103,28 +105,49 @@ def job_detail(request, job_id):
 @require_POST
 def cancel_job(request, job_id):
     job = owned_job(request.user, job_id)
-    with transaction.atomic():
-        job = SearchJob.objects.select_for_update().get(pk=job.pk, owner=request.user)
-        if job.status not in {SearchJob.Status.QUEUED, SearchJob.Status.RUNNING}:
-            messages.info(request, "این جست‌وجو قبلاً پایان یافته است.")
-            return redirect("job_detail", job_id=job.pk)
-        was_running = job.status == SearchJob.Status.RUNNING
-        now = timezone.now()
-        SearchJob.objects.filter(
-            pk=job.pk, status__in=[SearchJob.Status.QUEUED, SearchJob.Status.RUNNING]
-        ).update(
-            status=SearchJob.Status.CANCELLED,
-            completed_at=now,
-            error_summary="جست‌وجو به درخواست کاربر لغو شد؛ نتایج جمع‌آوری‌شده حفظ شده‌اند.",
-        )
-        SourceExecution.objects.filter(
-            search_job=job,
-            status__in=[SourceExecution.Status.QUEUED, SourceExecution.Status.RUNNING],
-        ).update(
-            status=SourceExecution.Status.CANCELLED,
-            completed_at=now,
-            error_details="جست‌وجو به درخواست کاربر لغو شد.",
-        )
+    was_running = job.status == SearchJob.Status.RUNNING
+    cancelled = False
+    for attempt in range(4):
+        try:
+            with transaction.atomic():
+                now = timezone.now()
+                changed = SearchJob.objects.filter(
+                    pk=job.pk, owner=request.user,
+                    status__in=[SearchJob.Status.QUEUED, SearchJob.Status.RUNNING],
+                ).update(
+                    status=SearchJob.Status.CANCELLED,
+                    completed_at=now,
+                    error_summary="جست‌وجو به درخواست کاربر لغو شد؛ نتایج جمع‌آوری‌شده حفظ شده‌اند.",
+                )
+                if changed:
+                    SourceExecution.objects.filter(
+                        search_job_id=job.pk,
+                        status__in=[SourceExecution.Status.QUEUED, SourceExecution.Status.RUNNING],
+                    ).update(
+                        status=SourceExecution.Status.CANCELLED,
+                        completed_at=now,
+                        error_details="جست‌وجو به درخواست کاربر لغو شد.",
+                    )
+                cancelled = bool(changed)
+            break
+        except OperationalError as exc:
+            db = connections["default"]
+            is_locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            if db.vendor != "sqlite" or not is_locked:
+                raise
+            if attempt == 3:
+                response = HttpResponse(
+                    "پایگاه داده موقتاً مشغول است؛ چند ثانیه بعد دوباره لغو را بزنید.",
+                    status=503,
+                    content_type="text/plain; charset=utf-8",
+                )
+                response["Retry-After"] = "2"
+                return response
+            db.close()
+            time.sleep(0.15 * (attempt + 1))
+    if not cancelled:
+        messages.info(request, "این جست‌وجو قبلاً پایان یافته است.")
+        return redirect("job_detail", job_id=job.pk)
     if job.celery_task_id:
         try:
             from config.celery import app as celery_app
