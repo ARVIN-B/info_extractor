@@ -1,6 +1,7 @@
 import json
 import re
 import unicodedata
+from html import unescape
 from dataclasses import dataclass
 from collections.abc import Mapping
 from urllib.parse import urlparse
@@ -32,6 +33,15 @@ def normalize_text(value):
     value = re.sub(r"^(?:شرکت|موسسه|مؤسسه)\s+", "", value)
     value = re.sub(r"\s+(?:سهامی خاص|سهامی عام|با مسئولیت محدود|مسئولیت محدود|تعاونی|غیرتجاری)$", "", value)
     return value.strip()
+
+
+def short_business_description(value, max_length=360):
+    """Return a compact, plain-text description suitable for a lead row."""
+    text = unescape(re.sub(r"<[^>]+>", " ", str(value or "")))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 1].rsplit(" ", 1)[0].rstrip(".,;: ") + "…"
 
 
 def normalize_phone(value):

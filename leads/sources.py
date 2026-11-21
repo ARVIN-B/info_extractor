@@ -17,7 +17,7 @@ from redis import Redis
 from .adapters import SOURCE_ADAPTERS, _records as _adapter_records, _with_phone_filter
 from .mcp_client import MCPBudgetExhausted, MCPSourceError, SOURCE_REGISTRY, source_session
 from .models import BusinessLead, BusinessPhone, BusinessPhoneEvidence, JobContact, LeadEvidence, SearchJob, SourceExecution, SourcePlaceDetailCache, SourceRateLimit, SourceToolCall, SuppressedPhone
-from .normalization import extract_iranian_mobiles, has_iranian_mobile, normalize_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid
+from .normalization import extract_iranian_mobiles, has_iranian_mobile, normalize_iranian_mobile, normalize_phone, normalize_text, normalize_website, phone_is_valid, short_business_description
 
 logger = logging.getLogger(__name__)
 
@@ -542,7 +542,7 @@ def save_lead(job, source, search_record, detail, return_created=False):
                 defaults={
                     "source_name": source, "business_name": fields["name"][:255],
                     "website": website, "address": fields["address"],
-                    "description": fields["description"][:5000], "evidence_url": source_url,
+                    "description": short_business_description(fields["description"]), "evidence_url": source_url,
                 },
             )
         permission = (

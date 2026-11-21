@@ -19,11 +19,11 @@ from .models import JobContact, SearchJob, SourceExecution, SourceRateLimit
 from .normalization import extract_iranian_mobiles, normalize_iranian_mobile, normalize_phone
 from .sources import _field_values, execute_source
 from .tasks import run_search_job
-from .web_search import WebServiceError, _public_http_url, crawl_domain, run_web_lane, search_domains
+from .web_search import WebServiceError, _normalized_search_url, _public_http_url, _search_queries, crawl_domain, fetch_searxng_page, run_web_lane, search_domains
 
 
 def make_job(*, requested=3, status=SearchJob.Status.QUEUED):
-    user = get_user_model().objects.create_user(username=f"test-{threading.get_ident()}")
+    user = get_user_model().objects.create_user(username=f"test-{threading.get_ident()}-{SearchJob.objects.count()}")
     job = SearchJob.objects.create(
         owner=user, trade_name="شیشه‌فروشی", geographic_scope_type=SearchJob.ScopeType.CITY,
         geographic_scope_name="اصفهان", selected_sources=["neshan", "balad", "emalls", "web"],
@@ -132,26 +132,205 @@ class PhoneOutputTests(TestCase):
 
 
 class WebDiscoveryTests(TestCase):
-    def test_search_uses_searx_json_and_deduplicates_domains(self):
+    def test_query_strategy_includes_trade_area_phone_and_english_phrasing(self):
+        queries = _search_queries(make_job())
+        self.assertEqual(len(queries), 3)
+        self.assertTrue(all("اصفهان" in query for query in queries))
+        self.assertIn("شماره", queries[0])
+        self.assertIn("business mobile phone website contact", queries[-1])
+        self.assertEqual(len({query.casefold() for query in queries}), len(queries))
+
+    @override_settings(SEARXNG_ENABLED=True, SEARXNG_MAX_PAGES=1, SEARXNG_MAX_QUERIES=1)
+    def test_search_authenticates_configures_language_and_preserves_metadata(self):
         calls = []
 
         def handler(request):
             calls.append(request)
             return httpx.Response(200, json={"results": [
-                {"url": "https://www.example.ir/shops"}, {"url": "https://example.ir/contact"},
-                {"url": "http://127.0.0.1/private"}, {"url": "https://other.ir/contact"},
+                {"url": "https://www.example.ir/shops?utm_source=test", "title": "فروشگاه نمونه", "content": "09123456789", "engines": ["brave", "google"], "publishedDate": "2026-11-20", "score": 3.5},
+                {"url": "https://example.ir/contact"},
+                {"url": "https://shop.example.ir/contact"},
+                {"url": "http://127.0.0.1/private"},
             ]})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
         job = make_job()
-        with override_settings(SEARXNG_BASE_URL="http://searx.test", WEB_SEARCH_ENABLED=True, WEB_SEARCH_MAX_RESULTS=10):
-            results = search_domains(job, client=client)
+        requests = [0]
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_LANGUAGE="fa", WEB_SEARCH_MAX_RESULTS=10):
+            results = search_domains(job, client=client, request_counter=requests)
         client.close()
-        self.assertEqual([item["url"] for item in results], ["https://www.example.ir/shops", "https://other.ir/contact"])
-        self.assertEqual(results[0]["title"], "")
+        self.assertEqual([item["url"] for item in results], ["https://www.example.ir/shops", "https://example.ir/contact", "https://shop.example.ir/contact"])
+        self.assertEqual(results[0]["title"], "فروشگاه نمونه")
+        self.assertEqual(results[0]["engines"], ["brave", "google"])
+        self.assertEqual(results[0]["published_date"], "2026-11-20")
+        self.assertTrue(all(request.headers.get("X-API-Key") == "fixture-key" for request in calls))
         self.assertTrue(all(request.url.params.get("format") == "json" for request in calls))
+        self.assertTrue(all(request.url.params.get("language") == "fa" for request in calls))
         self.assertEqual(len(calls), 1)
+        self.assertEqual(requests[0], 1)
         self.assertIn("اصفهان", calls[0].url.params["q"])
+
+    def test_missing_key_is_rejected_without_sending_a_request(self):
+        calls = []
+        client = httpx.Client(transport=httpx.MockTransport(lambda request: calls.append(request)))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY=""):
+            with self.assertRaisesRegex(WebServiceError, "SEARXNG_API_KEY"):
+                fetch_searxng_page("query", client=client)
+        client.close()
+        self.assertEqual(calls, [])
+
+    def test_http_scheme_is_rejected_for_searxng(self):
+        with override_settings(SEARXNG_BASE_URL="http://searx.test", SEARXNG_API_KEY="fixture-key"):
+            with self.assertRaisesRegex(WebServiceError, "HTTPS"):
+                fetch_searxng_page("query", client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200))))
+
+    def test_invalid_key_response_is_reported_without_echoing_credentials(self):
+        client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(403)))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="do-not-print-this"):
+            with self.assertRaises(WebServiceError) as caught:
+                fetch_searxng_page("query", client=client)
+        client.close()
+        self.assertIn("HTTP 403", str(caught.exception))
+        self.assertNotIn("do-not-print-this", str(caught.exception))
+
+    @override_settings(SEARXNG_ENABLED=True, SEARXNG_MAX_PAGES=2, SEARXNG_MAX_QUERIES=1)
+    def test_search_paginates_and_deduplicates_normalized_urls_but_keeps_subdomains(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            page = request.url.params.get("pageno")
+            rows = [{"url": "https://example.ir/?utm_campaign=x", "title": "Main"}, {"url": "https://shop.example.ir/contact", "title": "Shop"}]
+            if page == "2":
+                rows = [{"url": "https://example.ir/", "title": "duplicate"}, {"url": "https://other.ir/contact", "title": "Other"}]
+            return httpx.Response(200, json={"results": rows})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", WEB_SEARCH_MAX_RESULTS=10):
+            rows = search_domains(make_job(), client=client)
+        client.close()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([row["url"] for row in rows], ["https://example.ir/", "https://shop.example.ir/contact", "https://other.ir/contact"])
+        self.assertEqual([call.url.params["pageno"] for call in calls], ["1", "2"])
+
+    def test_empty_results_and_malformed_response_are_handled(self):
+        empty_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"results": []})))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key"):
+            self.assertEqual(fetch_searxng_page("query", client=empty_client), [])
+        empty_client.close()
+        malformed_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"not json")))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key"):
+            with self.assertRaisesRegex(WebServiceError, "malformed JSON"):
+                fetch_searxng_page("query", client=malformed_client)
+        malformed_client.close()
+        structure_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"results": {"unexpected": True}})))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key"):
+            with self.assertRaisesRegex(WebServiceError, "unexpected JSON"):
+                fetch_searxng_page("query", client=structure_client)
+        structure_client.close()
+
+    def test_http_400_is_not_retried_and_server_500_is_retried(self):
+        bad_request = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(400)))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_RETRIES=1):
+            with self.assertRaises(WebServiceError) as caught:
+                fetch_searxng_page("query", client=bad_request)
+        bad_request.close()
+        self.assertEqual(caught.exception.status_code, 400)
+
+        calls = []
+        def transient_server(request):
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(502)
+            return httpx.Response(200, json={"results": []})
+        server = httpx.Client(transport=httpx.MockTransport(transient_server))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_RETRIES=1):
+            self.assertEqual(fetch_searxng_page("query", client=server), [])
+        server.close()
+        self.assertEqual(len(calls), 2)
+
+    def test_transient_network_error_retries_once_without_logging_request_data(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            raise httpx.ConnectError("unreachable")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_RETRIES=1):
+            counter = [0]
+            with self.assertRaises(WebServiceError) as caught:
+                fetch_searxng_page("private query", client=client, request_counter=counter)
+        client.close()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(counter[0], 2)
+        self.assertNotIn("private query", str(caught.exception))
+
+    def test_request_timeout_is_retried_once_and_sanitized(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            raise httpx.ReadTimeout("timeout")
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_RETRIES=1):
+            with self.assertRaises(WebServiceError) as caught:
+                fetch_searxng_page("private query", client=client)
+        client.close()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("ReadTimeout", str(caught.exception))
+        self.assertNotIn("private query", str(caught.exception))
+
+    def test_searx_429_preserves_prior_page_results_and_sets_persistent_cooldown(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if request.url.params["pageno"] == "1":
+                return httpx.Response(200, json={"results": [{
+                    "url": "https://shop.example.ir", "title": "فروشگاه نمونه",
+                    "content": "09123456789 فروش لوازم الکترونیکی",
+                }]})
+            return httpx.Response(429, headers={"Retry-After": "120"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        job = make_job(requested=5, status=SearchJob.Status.RUNNING)
+        execution = SourceExecution.objects.create(search_job=job, source_name="web")
+
+        def fake_crawl(_url, request_counter=None):
+            request_counter[0] = 2
+            return []
+
+        with override_settings(SEARXNG_BASE_URL="https://searx.test", SEARXNG_API_KEY="fixture-key", SEARXNG_MAX_PAGES=2, SEARXNG_MAX_QUERIES=1, SEARXNG_RETRIES=1, WEB_CRAWL_CONCURRENCY=1):
+            with patch("leads.web_search._searxng_http_client", return_value=client), patch("leads.web_search.crawl_domain", side_effect=fake_crawl):
+                run_web_lane(job, execution)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, SourceExecution.Status.RATE_LIMITED)
+        self.assertEqual(execution.request_count, 4)
+        self.assertEqual(len(calls), 2)  # HTTP 429 is not retried.
+        self.assertTrue(job.contacts.filter(normalized_number="09123456789", business_name="فروشگاه نمونه").exists())
+        self.assertGreaterEqual((SourceRateLimit.objects.get(source_name="searxng").cooldown_until - timezone.now()).total_seconds(), 115)
+
+        later = make_job(requested=5, status=SearchJob.Status.RUNNING)
+        later_execution = SourceExecution.objects.create(search_job=later, source_name="web")
+        with patch("leads.web_search.search_domains") as search_again:
+            run_web_lane(later, later_execution)
+        later_execution.refresh_from_db()
+        search_again.assert_not_called()
+        self.assertEqual(later_execution.status, SourceExecution.Status.RATE_LIMITED)
+        client.close()
+
+    def test_url_normalization_strips_tracking_and_preserves_subdomain(self):
+        self.assertEqual(_normalized_search_url("https://Shop.Example.ir/path/?utm_medium=x&ref=ads&id=4#section"), "https://shop.example.ir/path?id=4")
+
+    def test_tls_client_uses_custom_ca_bundle_without_disabling_validation(self):
+        with override_settings(SEARXNG_CA_BUNDLE="/etc/ssl/certs/searxng-ca.pem", SEARXNG_VERIFY_TLS=False):
+            with patch("leads.web_search.ssl.create_default_context", return_value="verified-context") as context_factory, patch("leads.web_search.httpx.Client") as client_factory:
+                from .web_search import _searxng_http_client
+                _searxng_http_client()
+        context_factory.assert_called_once_with(cafile="/etc/ssl/certs/searxng-ca.pem")
+        self.assertEqual(client_factory.call_args.kwargs["verify"], "verified-context")
 
     def test_crawler_calls_self_hosted_v2_crawl_and_polls_until_complete(self):
         calls = []
@@ -184,17 +363,17 @@ class WebDiscoveryTests(TestCase):
         client = httpx.Client(transport=httpx.MockTransport(fail))
         job = make_job(status=SearchJob.Status.RUNNING)
         execution = SourceExecution.objects.create(search_job=job, source_name="web")
-        with override_settings(WEB_SEARCH_ENABLED=True, SEARXNG_BASE_URL="http://127.0.0.1:8080/private?token=secret"):
+        with override_settings(SEARXNG_ENABLED=True, SEARXNG_BASE_URL="https://127.0.0.1:8080/private?token=secret", SEARXNG_API_KEY="fixture-key"):
             with self.assertRaises(WebServiceError) as caught:
                 search_domains(job, client=client)
-            self.assertIn("http://127.0.0.1:8080", str(caught.exception))
+            self.assertIn("https://127.0.0.1:8080", str(caught.exception))
             self.assertNotIn("secret", str(caught.exception))
         with patch("leads.web_search.search_domains", side_effect=caught.exception):
             run_web_lane(job, execution)
         execution.refresh_from_db()
         client.close()
         self.assertEqual(execution.status, SourceExecution.Status.FAILED)
-        self.assertEqual(execution.request_count, 1)
+        self.assertEqual(execution.request_count, 0)
         self.assertIn("SearXNG", execution.error_details)
         self.assertNotIn("secret", execution.error_details)
 
@@ -203,7 +382,7 @@ class WebDiscoveryTests(TestCase):
         job = make_job(requested=2, status=SearchJob.Status.RUNNING)
         execution = SourceExecution.objects.create(search_job=job, source_name="web")
         pages = [
-            {"markdown": "شماره ۰۹۱۲۳۴۵۶۷۸۹ و +989123456780", "metadata": {"sourceURL": "https://one.ir/contact"}},
+            {"markdown": "شماره ۰۹۱۲۳۴۵۶۷۸۹ و +989123456780", "metadata": {"sourceURL": "https://one.ir/contact", "title": "فروشگاه اول", "description": "توضیح کوتاه"}},
             {"markdown": "تکراری 09123456789 و شمارهٔ دیگر 09123456781", "metadata": {"sourceURL": "https://two.ir/contact"}},
         ]
         def fake_crawl(url, request_counter=None):
@@ -213,7 +392,10 @@ class WebDiscoveryTests(TestCase):
             {"url": "https://one.ir/", "title": "فروشگاه اول", "content": ""},
             {"url": "https://two.ir/", "title": "فروشگاه دوم", "content": ""},
         ]
-        with patch("leads.web_search.search_domains", return_value=results), patch("leads.web_search.crawl_domain", side_effect=fake_crawl):
+        def fake_search(_job, request_counter=None):
+            request_counter[0] = 1
+            return results
+        with patch("leads.web_search.search_domains", side_effect=fake_search), patch("leads.web_search.crawl_domain", side_effect=fake_crawl):
             count = run_web_lane(job, execution)
         self.assertEqual(count, 2)
         self.assertEqual(job.contacts.count(), 2)
@@ -223,6 +405,7 @@ class WebDiscoveryTests(TestCase):
         contact = job.contacts.get(normalized_number="09123456789")
         self.assertEqual(contact.business_name, "فروشگاه اول")
         self.assertEqual(contact.website, "https://one.ir")
+        self.assertEqual(contact.description, "توضیح کوتاه")
 
     def test_regex_extracts_a_mobile_inside_html_tel_link(self):
         candidates = extract_iranian_mobiles('<a href="tel:+989123456789">تماس</a>', path="contact_page")

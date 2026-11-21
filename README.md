@@ -62,7 +62,9 @@ test -f .env || cp .env.example .env
 
 در `.env` مقادیر زیر را تنظیم کنید:
 
-- `SEARXNG_BASE_URL`: آدرس ریشهٔ SearXNG، مانند `http://127.0.0.1:8080`.
+- `SEARXNG_BASE_URL`, `SEARXNG_API_KEY`: endpoint HTTPS و کلید header `X-API-Key` برای SearXNG.
+- `SEARXNG_TIMEOUT`, `SEARXNG_LANGUAGE`, `SEARXNG_ENABLED`, `SEARXNG_MAX_PAGES`, `SEARXNG_MAX_QUERIES`, `SEARXNG_RETRIES`: محدودیت و رفتار جست‌وجوی SearXNG.
+- `SEARXNG_VERIFY_TLS`, `SEARXNG_CA_BUNDLE`: اعتبارسنجی TLS؛ CA سفارشی بر غیرفعال‌سازی verify ترجیح دارد.
 - `FIRECRAWL_BASE_URL`: آدرس ریشهٔ Firecrawl، مانند `http://127.0.0.1:3002`؛ کد مسیر `/v2` را اضافه می‌کند.
 - `FIRECRAWL_API_KEY`: اختیاری؛ اگر نمونهٔ Firecrawl شما Bearer authentication را فعال کرده، کلید همان سرویس را در `.env` بگذارید.
 - `WEB_SEARCH_ENABLED`: فعال/غیرفعال‌کردن lane وب.

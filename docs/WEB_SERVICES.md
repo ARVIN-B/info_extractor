@@ -13,7 +13,16 @@ GET /search?q=<query>&format=json&language=fa-IR&safesearch=1
 آدرس نمونه در `.env`:
 
 ```dotenv
-SEARXNG_BASE_URL=http://127.0.0.1:8080
+SEARXNG_BASE_URL=https://195.248.240.152:8888
+SEARXNG_API_KEY=your-private-key
+SEARXNG_TIMEOUT=30
+SEARXNG_LANGUAGE=fa
+SEARXNG_ENABLED=True
+SEARXNG_MAX_PAGES=5
+SEARXNG_MAX_QUERIES=3
+SEARXNG_RETRIES=1
+SEARXNG_VERIFY_TLS=True
+SEARXNG_CA_BUNDLE=
 ```
 
 اگر Django داخل container است، `127.0.0.1` به همان container اشاره می‌کند؛ hostname سرویس را وارد کنید.
@@ -56,12 +65,12 @@ WEB_CRAWL_TIMEOUT=60
 از همان محیط/شبکه‌ای که worker اجرا می‌شود بررسی کنید:
 
 ```powershell
-Invoke-WebRequest 'http://127.0.0.1:8080/search?q=test&format=json'
+Invoke-WebRequest 'https://195.248.240.152:8888/search?q=test&format=json&language=fa&pageno=1' -Headers @{ 'X-API-Key' = $env:SEARXNG_API_KEY }
 Invoke-WebRequest -Method Post 'http://127.0.0.1:3002/v2/crawl' -ContentType 'application/json' -Body '{"url":"https://example.com","limit":1,"scrapeOptions":{"formats":["markdown"]}}'
 ```
 
 ```bash
-curl 'http://127.0.0.1:8080/search?q=test&format=json'
+curl 'https://195.248.240.152:8888/search?q=test&format=json&language=fa&pageno=1' -H "X-API-Key: $SEARXNG_API_KEY"
 curl -X POST 'http://127.0.0.1:3002/v2/crawl' -H 'Content-Type: application/json' -d '{"url":"https://example.com","limit":1,"scrapeOptions":{"formats":["markdown"]}}'
 ```
 
@@ -77,3 +86,17 @@ curl -X POST 'http://127.0.0.1:3002/v2/crawl' -H 'Content-Type: application/json
 در خطای اتصال، صفحهٔ Job حالا نام سرویس، میزبان/درگاه تنظیم‌شده و نوع خطای شبکه یا کد HTTP را نشان می‌دهد؛ مسیر، query string و کلیدها در پیام خطا ثبت نمی‌شوند. اگر برنامه و worker داخل container هستند، `127.0.0.1` به همان container اشاره می‌کند؛ آدرس سرویس SearXNG و Firecrawl باید از شبکهٔ worker قابل دسترسی باشد. خطای `502` از SearXNG را در خود سرویس یا reverse proxy آن بررسی کنید و Firecrawl را از همان محیط worker با `GET /` یا endpoint health بررسی کنید.
 
 `request_count` برای lane وب شامل یک درخواست جست‌وجوی SearXNG و هر درخواست شروع/poll Firecrawl است. یک crawl می‌تواند حداکثر ۸ صفحه را برگرداند؛ افزایش تعداد صفحه‌ها ممکن است به درخواست‌های poll بیشتر و اجرای طولانی‌تر منجر شود. مقدار هدف تماس، crawl دامنه‌های جدید را متوقف می‌کند.
+
+## SearXNG: احراز هویت، TLS و جست‌وجوی کسب‌وکار
+
+SearXNG فقط از HTTPS فراخوانی می‌شود و هر درخواست جست‌وجو header `X-API-Key` را از `SEARXNG_API_KEY` می‌گیرد. کلید در query، لاگ یا فایل خروجی قرار نمی‌گیرد. برای TLS، حالت پیش‌فرض اعتبارسنجی گواهی را فعال نگه می‌دارد. اگر گواهی خودامضا است، راه مطمئن این است که CA آن را در فایل قابل‌دسترسی worker قرار دهید و `SEARXNG_CA_BUNDLE` را به مسیر آن بدهید. فقط در صورت پذیرش آگاهانهٔ ریسک می‌توان اعتبارسنجی همان اتصال SearXNG را با `SEARXNG_VERIFY_TLS=False` غیرفعال کرد؛ این تنظیم SSL سایر سرویس‌ها را تغییر نمی‌دهد.
+
+برنامه query صنف و شهر را با عبارت‌های فارسی و انگلیسی می‌سازد، از `pageno` برای خواندن تدریجی حداکثر `SEARXNG_MAX_PAGES` صفحه استفاده می‌کند و query تکراری را حذف می‌کند. هر صفحه یک درخواست شمرده می‌شود؛ یک retry محدود برای timeout/خطای شبکه و 5xx انجام می‌شود، اما 429 retry نمی‌شود و cooldown پایدار می‌گیرد. نتیجهٔ تکراری با URL نرمال‌شده ادغام می‌شود؛ مسیرهای متفاوت و زیردامنه‌ها حفظ می‌شوند. عنوان، snippet، engine، تاریخ انتشار و metadata در diagnostics منبع نگه‌داری می‌شوند. نتیجهٔ جست‌وجو سرنخ کشف است؛ تطبیق نام و محتوای سایت به‌تنهایی تأیید رسمی کسب‌وکار محسوب نمی‌شود.
+
+تست زنده را از همان محیطی که Celery worker اجرا می‌شود اجرا کنید:
+
+```bash
+python manage.py check_searxng --query "فروشگاه الکترونیکی اصفهان شماره تماس" --page 1
+```
+
+فرمان فقط وضعیت اتصال و شمار نتایج/engineها را چاپ می‌کند و کلید را نمایش نمی‌دهد. خطای 401/403 را برای کلید یا فعال‌بودن JSON، خطای TLS را برای CA/SAN گواهی و timeout/اتصال را برای دسترسی worker و firewall بررسی کنید.
